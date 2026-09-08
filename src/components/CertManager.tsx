@@ -164,63 +164,87 @@ export const CertManager: React.FC<CertManagerProps> = ({
       </div>
 
       {/* Certificates Cards / Table */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {certificates.map((cert) => (
-          <div
-            key={cert.id}
-            className="bg-zinc-900/90 border border-zinc-800 hover:border-zinc-700 rounded-xl p-5 shadow-sm space-y-4 font-mono text-xs transition-all"
+      {certificates.length === 0 ? (
+        <div className="bg-zinc-950/70 border border-zinc-800/80 rounded-xl p-8 text-center space-y-3 font-mono">
+          <KeyRound className="w-10 h-10 text-zinc-600 mx-auto" />
+          <h3 className="text-sm font-semibold text-zinc-300">
+            {language === 'ua' ? 'Немає активних SSL/TLS сертифікатів' : 'No active SSL/TLS certificates'}
+          </h3>
+          <p className="text-xs text-zinc-500 max-w-md mx-auto">
+            {language === 'ua'
+              ? 'Натисніть кнопку "Випустити Новий Сертифікат" для автоматичного запиту валідації ACME v2 DNS-01 або HTTP-01.'
+              : 'Click "Issue New Certificate" to trigger automated ACME v2 DNS-01 or HTTP-01 issuance.'}
+          </p>
+          <button
+            onClick={() => {
+              setIssueStep('form');
+              setIsModalOpen(true);
+            }}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-lg shadow-emerald-900/30 transition-colors"
           >
-            <div className="flex items-start justify-between">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.7)]"></span>
-                  <h3 className="font-bold text-white text-sm tracking-wide">{cert.domain}</h3>
+            <Plus className="w-4 h-4" />
+            <span>{t.issueNewBtn}</span>
+          </button>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {certificates.map((cert) => (
+            <div
+              key={cert.id}
+              className="bg-zinc-900/90 border border-zinc-800 hover:border-zinc-700 rounded-xl p-5 shadow-sm space-y-4 font-mono text-xs transition-all"
+            >
+              <div className="flex items-start justify-between">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.7)]"></span>
+                    <h3 className="font-bold text-white text-sm tracking-wide">{cert.domain}</h3>
+                  </div>
+                  <div className="text-[11px] text-zinc-400 mt-1">Issuer: {cert.issuer}</div>
                 </div>
-                <div className="text-[11px] text-zinc-400 mt-1">Issuer: {cert.issuer}</div>
+
+                <span className="px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-800 text-emerald-300 uppercase text-[10px] font-bold">
+                  {cert.status}
+                </span>
               </div>
 
-              <span className="px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-800 text-emerald-300 uppercase text-[10px] font-bold">
-                {cert.status}
-              </span>
+              {/* SANs and challenge info */}
+              <div className="bg-zinc-950/80 p-3 rounded-lg border border-zinc-800/80 space-y-2">
+                <div className="flex justify-between">
+                  <span className="text-zinc-500">Challenge Type:</span>
+                  <span className="text-zinc-300">{cert.challengeType}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-zinc-500">Valid Period:</span>
+                  <span className="text-zinc-300">{cert.validFrom} → {cert.validTo}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-zinc-500">Days Remaining:</span>
+                  <span className="text-emerald-400 font-bold">{cert.daysRemaining} days</span>
+                </div>
+                <div className="text-[10px] text-zinc-500 truncate pt-1 border-t border-zinc-850">
+                  Fingerprint: {cert.fingerprint}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-zinc-800 text-xs">
+                <span className="text-zinc-400 flex items-center gap-1.5">
+                  <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Auto-renew: ON (at 30 days)</span>
+                </span>
+
+                <button
+                  onClick={() => onRenewCert(cert.id)}
+                  disabled={cert.status === 'renewing'}
+                  className="px-3 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 transition-colors flex items-center gap-1"
+                >
+                  <RefreshCw className={`w-3 h-3 ${cert.status === 'renewing' ? 'animate-spin' : ''}`} />
+                  <span>{cert.status === 'renewing' ? t.renewing : t.forceRenewBtn}</span>
+                </button>
+              </div>
             </div>
-
-            {/* SANs and challenge info */}
-            <div className="bg-zinc-950/80 p-3 rounded-lg border border-zinc-800/80 space-y-2">
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Challenge Type:</span>
-                <span className="text-zinc-300">{cert.challengeType}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Valid Period:</span>
-                <span className="text-zinc-300">{cert.validFrom} → {cert.validTo}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">Days Remaining:</span>
-                <span className="text-emerald-400 font-bold">{cert.daysRemaining} days</span>
-              </div>
-              <div className="text-[10px] text-zinc-500 truncate pt-1 border-t border-zinc-850">
-                Fingerprint: {cert.fingerprint}
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between pt-2 border-t border-zinc-800 text-xs">
-              <span className="text-zinc-400 flex items-center gap-1.5">
-                <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Auto-renew: ON (at 30 days)</span>
-              </span>
-
-              <button
-                onClick={() => onRenewCert(cert.id)}
-                disabled={cert.status === 'renewing'}
-                className="px-3 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 transition-colors flex items-center gap-1"
-              >
-                <RefreshCw className={`w-3 h-3 ${cert.status === 'renewing' ? 'animate-spin' : ''}`} />
-                <span>{cert.status === 'renewing' ? t.renewing : t.forceRenewBtn}</span>
-              </button>
-            </div>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      )}
 
       {/* Modal for Issuing New SSL Cert */}
       {isModalOpen && (

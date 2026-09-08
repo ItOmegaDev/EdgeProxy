@@ -220,28 +220,34 @@ export const TunnelsView: React.FC<TunnelsViewProps> = ({
         </div>
 
         <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
-          {discoveredServices.map((service) => (
-            <div
-              key={service.id}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-xs font-mono whitespace-nowrap flex-shrink-0 hover:border-zinc-700"
-            >
-              <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-              <span className="text-white font-medium">{service.name}</span>
-              <span className="text-zinc-500">:{service.port}</span>
-              {service.isTunneled ? (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800">
-                  Active
-                </span>
-              ) : (
-                <button
-                  onClick={() => handleAutoExpose(service)}
-                  className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 font-bold transition-colors"
-                >
-                  + {t.exposeBtn}
-                </button>
-              )}
+          {discoveredServices.length === 0 ? (
+            <div className="text-xs text-zinc-500 py-1 font-mono">
+              {language === 'ua' ? 'Локальні порти скануються на 127.0.0.1...' : 'Scanning local ports on 127.0.0.1...'}
             </div>
-          ))}
+          ) : (
+            discoveredServices.map((service) => (
+              <div
+                key={service.id}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-xs font-mono whitespace-nowrap flex-shrink-0 hover:border-zinc-700"
+              >
+                <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                <span className="text-white font-medium">{service.name}</span>
+                <span className="text-zinc-500">:{service.port}</span>
+                {service.isTunneled ? (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800">
+                    Active
+                  </span>
+                ) : (
+                  <button
+                    onClick={() => handleAutoExpose(service)}
+                    className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 font-bold transition-colors"
+                  >
+                    + {t.exposeBtn}
+                  </button>
+                )}
+              </div>
+            ))
+          )}
         </div>
       </div>
 
@@ -262,8 +268,31 @@ export const TunnelsView: React.FC<TunnelsViewProps> = ({
       </div>
 
       {/* Tunnel Cards Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {filteredTunnels.map((tunnel) => {
+      {filteredTunnels.length === 0 ? (
+        <div className="bg-zinc-950/70 border border-zinc-800/80 rounded-xl p-8 text-center space-y-3 font-mono">
+          <Server className="w-10 h-10 text-zinc-600 mx-auto" />
+          <h3 className="text-sm font-semibold text-zinc-300">
+            {language === 'ua' ? 'Немає активних тунелів' : 'No active tunnels'}
+          </h3>
+          <p className="text-xs text-zinc-500 max-w-md mx-auto">
+            {language === 'ua'
+              ? 'Створіть новий тунель через кнопку вище або підключіть локальний Go Agent (go run agent/main.go --port 3000)'
+              : 'Create a new tunnel using the button above or connect local Go Agent (go run agent/main.go --port 3000)'}
+          </p>
+          <button
+            onClick={() => {
+              resetForm();
+              setIsModalOpen(true);
+            }}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-lg shadow-emerald-900/30 transition-colors"
+          >
+            <Plus className="w-4 h-4" />
+            {language === 'ua' ? 'Створити перший тунель' : 'Create First Tunnel'}
+          </button>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {filteredTunnels.map((tunnel) => {
           const publicUrl = `https://${tunnel.subdomain}.edgeproxy.mesh`;
           const isOnline = tunnel.status === 'online';
 
@@ -364,6 +393,7 @@ export const TunnelsView: React.FC<TunnelsViewProps> = ({
           );
         })}
       </div>
+      )}
 
       {/* Modal for Creating New Tunnel */}
       {isModalOpen && (

@@ -16,6 +16,7 @@ import {
   Layers
 } from 'lucide-react';
 import { RateLimiterConfig, TrafficRequest } from '../types';
+import { api } from '../services/api';
 
 interface RateLimiterDDoSProps {
   config: RateLimiterConfig;
@@ -104,6 +105,7 @@ export const RateLimiterDDoS: React.FC<RateLimiterDDoSProps> = ({
       blockedIpRecords: config.blockedIpRecords.filter((rec) => rec.ip !== ipToUnban),
       blacklistedIps: config.blacklistedIps.filter((ip) => ip !== ipToUnban),
     });
+    api.unbanIp(ipToUnban).catch(() => {});
   };
 
   const handleAddWhitelist = (e: React.FormEvent) => {

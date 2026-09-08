@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  # Edge Gateway (High-Load Go Reverse Proxy & Multiplexer)
+  edge-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: edgeproxy-gateway
+    restart: unless-stopped
+    ports:
+      - "80:80"       # Public HTTP Ingress
+      - "443:443"     # Public HTTPS (ACME TLS)
+      - "4242:4242"   # TCP Multiplexed Control Plane for Agents
+    environment:
+      - BASE_DOMAIN=edgeproxy.mesh
+      - RATE_LIMIT_RPS=100
+      - BURST_CAPACITY=150
+    networks:
+      - edgeproxy-net
+
+  # Web Control Plane & Telemetry Dashboard
+  web-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: edgeproxy-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - GATEWAY_API_URL=http://edge-gateway:80
+    depends_on:
+      - edge-gateway
+    networks:
+      - edgeproxy-net
+
+networks:
+  edgeproxy-net:
+    driver: bridge

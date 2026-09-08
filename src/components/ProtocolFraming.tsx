@@ -15,7 +15,6 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { BinaryFrame, BinaryFrameType } from '../types';
-import { INITIAL_BINARY_FRAMES } from '../mockData';
 
 interface ProtocolFramingProps {
   language: 'ua' | 'en';
@@ -57,8 +56,8 @@ const FRAME_TYPES_INFO = [
 ];
 
 export const ProtocolFraming: React.FC<ProtocolFramingProps> = ({ language }) => {
-  const [frames, setFrames] = useState<BinaryFrame[]>(INITIAL_BINARY_FRAMES);
-  const [selectedFrame, setSelectedFrame] = useState<BinaryFrame>(INITIAL_BINARY_FRAMES[0]);
+  const [frames, setFrames] = useState<BinaryFrame[]>([]);
+  const [selectedFrame, setSelectedFrame] = useState<BinaryFrame | null>(null);
   const [copiedHex, setCopiedHex] = useState(false);
 
   // Playground input state
@@ -366,7 +365,7 @@ export const ProtocolFraming: React.FC<ProtocolFramingProps> = ({ language }) =>
             <p className="text-xs text-zinc-400 mt-0.5">{t.singleConnNote}</p>
           </div>
           <button
-            onClick={() => setFrames(INITIAL_BINARY_FRAMES)}
+            onClick={() => setFrames([])}
             className="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-200 px-2.5 py-1 rounded bg-zinc-800"
           >
             <RefreshCw className="w-3 h-3" />
@@ -376,8 +375,13 @@ export const ProtocolFraming: React.FC<ProtocolFramingProps> = ({ language }) =>
 
         {/* Live Frame Timeline */}
         <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
-          {frames.map((frame) => {
-            const isSelected = selectedFrame?.id === frame.id;
+          {frames.length === 0 ? (
+            <div className="py-8 text-center text-zinc-500 font-mono text-xs">
+              {language === 'ua' ? 'Кадри відсутні. Використайте генератор вище для кодування та надсилання нового бінарного кадру.' : 'No binary frames recorded. Use the generator above to encode and transmit a binary frame.'}
+            </div>
+          ) : (
+            frames.map((frame) => {
+              const isSelected = selectedFrame?.id === frame.id;
             const typeColor = 
               frame.frameType === 'SYN' ? 'text-emerald-400 bg-emerald-950/60 border-emerald-500/40' :
               frame.frameType === 'DATA' ? 'text-sky-400 bg-sky-950/60 border-sky-500/40' :
@@ -417,7 +421,8 @@ export const ProtocolFraming: React.FC<ProtocolFramingProps> = ({ language }) =>
                 </div>
               </div>
             );
-          })}
+          })
+        )}
         </div>
       </div>
     </div>

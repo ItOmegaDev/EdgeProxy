@@ -13,7 +13,8 @@ import {
   Activity,
   Binary,
   Database,
-  GitBranch
+  GitBranch,
+  Code2
 } from 'lucide-react';
 import { TelemetryMetrics } from '../types';
 
@@ -50,6 +51,7 @@ export const Navbar: React.FC<NavbarProps> = ({
       navMesh: 'Архітектура',
       navProtocol: 'Бінарний Протокол',
       navDb: 'База SQL',
+      navCore: 'Go/SQL Ядро',
       navRoadmap: 'План Розробки',
       navTunnels: 'Тунелі',
       navTraffic: 'Live Трафік',
@@ -69,6 +71,7 @@ export const Navbar: React.FC<NavbarProps> = ({
       navMesh: 'Architecture',
       navProtocol: 'Binary Protocol',
       navDb: 'Database SQL',
+      navCore: 'Go Core & SQL',
       navRoadmap: 'Dev Roadmap',
       navTunnels: 'Tunnels',
       navTraffic: 'Live Traffic',
@@ -83,6 +86,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   const navItems = [
     { id: 'topology', label: t.navMesh, icon: Layers },
+    { id: 'core', label: t.navCore, icon: Code2 },
     { id: 'protocol', label: t.navProtocol, icon: Binary },
     { id: 'database', label: t.navDb, icon: Database },
     { id: 'roadmap', label: t.navRoadmap, icon: GitBranch },

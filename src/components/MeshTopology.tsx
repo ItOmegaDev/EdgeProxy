@@ -410,20 +410,26 @@ export const MeshTopology: React.FC<MeshTopologyProps> = ({
                 </button>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 font-mono text-xs">
-                {tunnels.map((tun) => (
-                  <div key={tun.id} className="flex items-center justify-between p-2 rounded bg-zinc-900 border border-zinc-800">
-                    <div className="flex items-center gap-1.5 truncate">
-                      <span className="w-2 h-2 rounded-full bg-emerald-400 flex-shrink-0"></span>
-                      <span className="text-emerald-300 font-medium truncate">{tun.subdomain}.edgeproxy.mesh</span>
-                    </div>
-                    <div className="text-zinc-400 flex items-center gap-1 flex-shrink-0">
-                      <span>→</span>
-                      <span className="text-white bg-zinc-800 px-1.5 py-0.5 rounded text-[11px]">
-                        :{tun.targetPort}
-                      </span>
-                    </div>
+                {tunnels.length === 0 ? (
+                  <div className="col-span-2 text-zinc-500 py-3 text-center">
+                    {language === 'ua' ? 'Немає активних тунелів. Створіть перший тунель у вкладці Tunnels.' : 'No active tunnels. Create one in the Tunnels tab.'}
                   </div>
-                ))}
+                ) : (
+                  tunnels.map((tun) => (
+                    <div key={tun.id} className="flex items-center justify-between p-2 rounded bg-zinc-900 border border-zinc-800">
+                      <div className="flex items-center gap-1.5 truncate">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400 flex-shrink-0"></span>
+                        <span className="text-emerald-300 font-medium truncate">{tun.subdomain}.edgeproxy.mesh</span>
+                      </div>
+                      <div className="text-zinc-400 flex items-center gap-1 flex-shrink-0">
+                        <span>→</span>
+                        <span className="text-white bg-zinc-800 px-1.5 py-0.5 rounded text-[11px]">
+                          :{tun.targetPort}
+                        </span>
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           </div>

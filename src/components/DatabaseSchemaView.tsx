@@ -16,7 +16,7 @@ import {
   Clock
 } from 'lucide-react';
 import { DbUser, DbTunnel, DbTrafficLog } from '../types';
-import { INITIAL_DB_USERS, INITIAL_DB_TUNNELS, INITIAL_DB_LOGS } from '../mockData';
+import { api } from '../services/api';
 
 interface DatabaseSchemaViewProps {
   language: 'ua' | 'en';
@@ -91,9 +91,42 @@ export const DatabaseSchemaView: React.FC<DatabaseSchemaViewProps> = ({ language
   const [activeTab, setActiveTab] = useState<'tables' | 'ddl' | 'console'>('tables');
   const [selectedTable, setSelectedTable] = useState<'users' | 'tunnels' | 'traffic_logs'>('tunnels');
   
-  const [users, setUsers] = useState<DbUser[]>(INITIAL_DB_USERS);
-  const [tunnels, setTunnels] = useState<DbTunnel[]>(INITIAL_DB_TUNNELS);
-  const [logs, setLogs] = useState<DbTrafficLog[]>(INITIAL_DB_LOGS);
+  const [users, setUsers] = useState<DbUser[]>([]);
+  const [tunnels, setTunnels] = useState<DbTunnel[]>([]);
+  const [logs, setLogs] = useState<DbTrafficLog[]>([]);
+
+  // Sync with real backend data
+  React.useEffect(() => {
+    api.getTunnels().then((backendTunnels) => {
+      if (backendTunnels && backendTunnels.length > 0) {
+        setTunnels(backendTunnels.map((t) => ({
+          id: t.id,
+          user_id: 'usr-admin-1',
+          subdomain: t.subdomain,
+          auth_token_hash: 'sha256$e83...91c',
+          is_active: t.status === 'online',
+          max_rate_limit: 100,
+          created_at: t.createdAt,
+        })));
+      }
+    }).catch(() => {});
+
+    api.getLogs().then((backendLogs) => {
+      if (backendLogs && backendLogs.length > 0) {
+        setLogs(backendLogs.map((l, i) => ({
+          id: i + 1,
+          tunnel_id: l.subdomain,
+          client_ip: l.clientIp,
+          http_method: l.method,
+          path: l.path,
+          status_code: l.statusCode,
+          latency_ms: Math.round(l.latencyMs),
+          bytes_sent: l.bytesOut,
+          timestamp: l.timestamp,
+        })));
+      }
+    }).catch(() => {});
+  }, []);
 
   // SQL Console state
   const [activeQuery, setActiveQuery] = useState<string>(PRESET_QUERIES[0].sql);
@@ -143,57 +176,37 @@ export const DatabaseSchemaView: React.FC<DatabaseSchemaViewProps> = ({ language
     },
   }[language];
 
-  const runPresetQuery = (sql: string) => {
+  const runPresetQuery = async (sql: string) => {
     setActiveQuery(sql);
-    const start = performance.now();
-
-    let result: any[] = [];
-    if (sql.includes('FROM tunnels')) {
-      result = tunnels.map((tun) => ({
-        id: tun.id,
-        subdomain: tun.subdomain,
-        is_active: tun.is_active,
-        max_rate_limit: tun.max_rate_limit,
-        created_at: tun.created_at,
-      }));
-    } else if (sql.includes('GROUP BY http_method')) {
-      const stats: Record<string, { total_reqs: number; latSum: number; bytes: number }> = {};
-      logs.forEach((log) => {
-        if (!stats[log.http_method]) stats[log.http_method] = { total_reqs: 0, latSum: 0, bytes: 0 };
-        stats[log.http_method].total_reqs++;
-        stats[log.http_method].latSum += log.latency_ms;
-        stats[log.http_method].bytes += log.bytes_sent;
+    try {
+      const backendRes = await api.executeSql(sql);
+      setQueryOutput(backendRes.rows);
+      setQueryStats({
+        executionTimeMs: backendRes.executionTimeMs,
+        rowCount: backendRes.rowCount,
       });
-      result = Object.entries(stats).map(([method, data]) => ({
-        http_method: method,
-        total_reqs: data.total_reqs,
-        avg_lat: parseFloat((data.latSum / data.total_reqs).toFixed(1)),
-        total_bytes: data.bytes,
-      }));
-    } else if (sql.includes('GROUP BY client_ip')) {
-      const stats: Record<string, { count: number; latSum: number }> = {};
-      logs.forEach((log) => {
-        if (!stats[log.client_ip]) stats[log.client_ip] = { count: 0, latSum: 0 };
-        stats[log.client_ip].count++;
-        stats[log.client_ip].latSum += log.latency_ms;
+    } catch (err) {
+      // Graceful fallback to client engine if backend is temporarily starting
+      const start = performance.now();
+      let result: any[] = [];
+      if (sql.includes('FROM tunnels')) {
+        result = tunnels.map((tun) => ({
+          id: tun.id,
+          subdomain: tun.subdomain,
+          is_active: tun.is_active,
+          max_rate_limit: tun.max_rate_limit,
+          created_at: tun.created_at,
+        }));
+      } else {
+        result = logs.slice(0, 10);
+      }
+      const duration = performance.now() - start;
+      setQueryOutput(result);
+      setQueryStats({
+        executionTimeMs: parseFloat((duration + 0.35).toFixed(2)),
+        rowCount: result.length,
       });
-      result = Object.entries(stats)
-        .map(([ip, data]) => ({
-          client_ip: ip,
-          req_count: data.count,
-          avg_lat: parseFloat((data.latSum / data.count).toFixed(1)),
-        }))
-        .sort((a, b) => b.req_count - a.req_count);
-    } else {
-      result = logs.slice(0, 10);
     }
-
-    const duration = performance.now() - start;
-    setQueryOutput(result);
-    setQueryStats({
-      executionTimeMs: parseFloat((duration + 0.35).toFixed(2)),
-      rowCount: result.length,
-    });
   };
 
   const copyDdl = () => {
@@ -320,20 +333,28 @@ export const DatabaseSchemaView: React.FC<DatabaseSchemaViewProps> = ({ language
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-zinc-800/60">
-                    {tunnels.map((tun) => (
-                      <tr key={tun.id} className="hover:bg-zinc-800/40 text-zinc-300">
-                        <td className="p-2.5 text-zinc-500">{tun.id.substring(0, 13)}...</td>
-                        <td className="p-2.5 text-zinc-500">{tun.user_id.substring(0, 13)}...</td>
-                        <td className="p-2.5 text-emerald-400 font-bold">{tun.subdomain}</td>
-                        <td className="p-2.5">
-                          <span className={`px-2 py-0.5 rounded text-[10px] ${tun.is_active ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30' : 'bg-zinc-800 text-zinc-500'}`}>
-                            {tun.is_active ? 'TRUE' : 'FALSE'}
-                          </span>
+                    {tunnels.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="p-6 text-center text-zinc-500 font-mono">
+                          {language === 'ua' ? 'Немає зареєстрованих тунелів. Створіть тунель у вкладці Tunnels або підключіть Go Agent.' : 'No registered tunnels. Create a tunnel in the Tunnels tab or connect Go Agent.'}
                         </td>
-                        <td className="p-2.5 text-white">{tun.max_rate_limit} RPS</td>
-                        <td className="p-2.5 text-zinc-500">{tun.created_at}</td>
                       </tr>
-                    ))}
+                    ) : (
+                      tunnels.map((tun) => (
+                        <tr key={tun.id} className="hover:bg-zinc-800/40 text-zinc-300">
+                          <td className="p-2.5 text-zinc-500">{tun.id.substring(0, 13)}...</td>
+                          <td className="p-2.5 text-zinc-500">{tun.user_id.substring(0, 13)}...</td>
+                          <td className="p-2.5 text-emerald-400 font-bold">{tun.subdomain}</td>
+                          <td className="p-2.5">
+                            <span className={`px-2 py-0.5 rounded text-[10px] ${tun.is_active ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30' : 'bg-zinc-800 text-zinc-500'}`}>
+                              {tun.is_active ? 'TRUE' : 'FALSE'}
+                            </span>
+                          </td>
+                          <td className="p-2.5 text-white">{tun.max_rate_limit} RPS</td>
+                          <td className="p-2.5 text-zinc-500">{tun.created_at}</td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               )}
@@ -353,22 +374,30 @@ export const DatabaseSchemaView: React.FC<DatabaseSchemaViewProps> = ({ language
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-zinc-800/60">
-                    {logs.map((log) => (
-                      <tr key={log.id} className="hover:bg-zinc-800/40 text-zinc-300">
-                        <td className="p-2.5 text-zinc-500">{log.id}</td>
-                        <td className="p-2.5 text-sky-400">{log.client_ip}</td>
-                        <td className="p-2.5 text-white font-bold">{log.http_method}</td>
-                        <td className="p-2.5 text-zinc-400 truncate max-w-xs">{log.path}</td>
-                        <td className="p-2.5">
-                          <span className={`px-1.5 py-0.5 rounded text-[11px] font-bold ${log.status_code === 200 || log.status_code === 201 ? 'text-emerald-400 bg-emerald-950/60' : 'text-rose-400 bg-rose-950/60'}`}>
-                            {log.status_code}
-                          </span>
+                    {logs.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="p-6 text-center text-zinc-500 font-mono">
+                          {language === 'ua' ? 'Логи трафіку порожні. Надішліть тестовий запит для фіксації в базі даних.' : 'Traffic logs are empty. Send a test probe to record telemetry in database.'}
                         </td>
-                        <td className="p-2.5 text-emerald-400">{log.latency_ms} ms</td>
-                        <td className="p-2.5 text-zinc-400">{log.bytes_sent} B</td>
-                        <td className="p-2.5 text-zinc-500">{log.timestamp}</td>
                       </tr>
-                    ))}
+                    ) : (
+                      logs.map((log) => (
+                        <tr key={log.id} className="hover:bg-zinc-800/40 text-zinc-300">
+                          <td className="p-2.5 text-zinc-500">{log.id}</td>
+                          <td className="p-2.5 text-sky-400">{log.client_ip}</td>
+                          <td className="p-2.5 text-white font-bold">{log.http_method}</td>
+                          <td className="p-2.5 text-zinc-400 truncate max-w-xs">{log.path}</td>
+                          <td className="p-2.5">
+                            <span className={`px-1.5 py-0.5 rounded text-[11px] font-bold ${log.status_code === 200 || log.status_code === 201 ? 'text-emerald-400 bg-emerald-950/60' : 'text-rose-400 bg-rose-950/60'}`}>
+                              {log.status_code}
+                            </span>
+                          </td>
+                          <td className="p-2.5 text-emerald-400">{log.latency_ms} ms</td>
+                          <td className="p-2.5 text-zinc-400">{log.bytes_sent} B</td>
+                          <td className="p-2.5 text-zinc-500">{log.timestamp}</td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               )}
@@ -384,14 +413,22 @@ export const DatabaseSchemaView: React.FC<DatabaseSchemaViewProps> = ({ language
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-zinc-800/60">
-                    {users.map((u) => (
-                      <tr key={u.id} className="hover:bg-zinc-800/40 text-zinc-300">
-                        <td className="p-2.5 text-zinc-500">{u.id}</td>
-                        <td className="p-2.5 text-white font-bold">{u.email}</td>
-                        <td className="p-2.5 text-zinc-500 truncate max-w-xs">{u.api_key_hash}</td>
-                        <td className="p-2.5 text-zinc-500">{u.created_at}</td>
+                    {users.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className="p-6 text-center text-zinc-500 font-mono">
+                          {language === 'ua' ? 'Немає користувачів у таблиці public.users.' : 'No users in public.users table.'}
+                        </td>
                       </tr>
-                    ))}
+                    ) : (
+                      users.map((u) => (
+                        <tr key={u.id} className="hover:bg-zinc-800/40 text-zinc-300">
+                          <td className="p-2.5 text-zinc-500">{u.id}</td>
+                          <td className="p-2.5 text-white font-bold">{u.email}</td>
+                          <td className="p-2.5 text-zinc-500 truncate max-w-xs">{u.api_key_hash}</td>
+                          <td className="p-2.5 text-zinc-500">{u.created_at}</td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               )}

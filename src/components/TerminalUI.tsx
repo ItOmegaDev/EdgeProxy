@@ -187,12 +187,16 @@ export const TerminalUI: React.FC<TerminalUIProps> = ({
             <div className="border border-emerald-900 rounded p-3 bg-[#080d14]">
               <div className="text-emerald-300 font-bold mb-2">ACTIVE TUNNEL ROUTES</div>
               <div className="space-y-1 text-[11px]">
-                {tunnels.map((t) => (
-                  <div key={t.id} className="flex justify-between text-zinc-300">
-                    <span className="text-emerald-400">{t.subdomain}.edgeproxy.mesh</span>
-                    <span className="text-zinc-500">→ 127.0.0.1:{t.targetPort} ({t.protocol.toUpperCase()})</span>
-                  </div>
-                ))}
+                {tunnels.length === 0 ? (
+                  <div className="text-zinc-500 italic">No active tunnels configured</div>
+                ) : (
+                  tunnels.map((t) => (
+                    <div key={t.id} className="flex justify-between text-zinc-300">
+                      <span className="text-emerald-400">{t.subdomain}.edgeproxy.mesh</span>
+                      <span className="text-zinc-500">→ 127.0.0.1:{t.targetPort} ({t.protocol.toUpperCase()})</span>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
 
@@ -232,16 +236,24 @@ export const TerminalUI: React.FC<TerminalUIProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-900">
-              {tunnels.map((t) => (
-                <tr key={t.id} className="text-zinc-300">
-                  <td className="py-1 text-emerald-400 font-bold">{t.subdomain}.edgeproxy.mesh</td>
-                  <td className="py-1">{t.targetHost}:{t.targetPort}</td>
-                  <td className="py-1 uppercase text-zinc-400">{t.protocol}</td>
-                  <td className="py-1 text-white">{t.activeStreams}</td>
-                  <td className="py-1 text-amber-400">{t.rateLimit.maxRps} r/s</td>
-                  <td className="py-1 text-emerald-400 uppercase font-semibold">{t.status}</td>
+              {tunnels.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="py-3 text-center text-zinc-500 italic">
+                    No active tunnels configured.
+                  </td>
                 </tr>
-              ))}
+              ) : (
+                tunnels.map((t) => (
+                  <tr key={t.id} className="text-zinc-300">
+                    <td className="py-1 text-emerald-400 font-bold">{t.subdomain}.edgeproxy.mesh</td>
+                    <td className="py-1">{t.targetHost}:{t.targetPort}</td>
+                    <td className="py-1 uppercase text-zinc-400">{t.protocol}</td>
+                    <td className="py-1 text-white">{t.activeStreams}</td>
+                    <td className="py-1 text-amber-400">{t.rateLimit.maxRps} r/s</td>
+                    <td className="py-1 text-emerald-400 uppercase font-semibold">{t.status}</td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>
@@ -255,26 +267,32 @@ export const TerminalUI: React.FC<TerminalUIProps> = ({
           </div>
 
           <div className="max-h-72 overflow-y-auto space-y-1 text-[10px]">
-            {requests.slice(0, 25).map((req) => (
-              <div key={req.id} className="flex items-center gap-2 hover:bg-zinc-900/60 p-0.5 rounded">
-                <span className="text-zinc-500">{new Date(req.timestamp).toLocaleTimeString()}</span>
-                <span
-                  className={`font-bold px-1 rounded ${
-                    req.statusCode === 200
-                      ? 'text-emerald-400 bg-emerald-950'
-                      : req.statusCode === 429
-                      ? 'text-amber-400 bg-amber-950'
-                      : 'text-rose-400 bg-rose-950'
-                  }`}
-                >
-                  [{req.statusCode}]
-                </span>
-                <span className="text-zinc-400 uppercase font-bold">{req.method}</span>
-                <span className="text-zinc-200 truncate max-w-xs">{req.host}{req.path}</span>
-                <span className="text-zinc-500 ml-auto">({req.durationMs}ms)</span>
-                <span className="text-zinc-400">{req.clientIp}</span>
+            {requests.length === 0 ? (
+              <div className="py-6 text-center text-zinc-500 italic">
+                No traffic logs yet. Send a test probe to record packets.
               </div>
-            ))}
+            ) : (
+              requests.slice(0, 25).map((req) => (
+                <div key={req.id} className="flex items-center gap-2 hover:bg-zinc-900/60 p-0.5 rounded">
+                  <span className="text-zinc-500">{new Date(req.timestamp).toLocaleTimeString()}</span>
+                  <span
+                    className={`font-bold px-1 rounded ${
+                      req.statusCode === 200
+                        ? 'text-emerald-400 bg-emerald-950'
+                        : req.statusCode === 429
+                        ? 'text-amber-400 bg-amber-950'
+                        : 'text-rose-400 bg-rose-950'
+                    }`}
+                  >
+                    [{req.statusCode}]
+                  </span>
+                  <span className="text-zinc-400 uppercase font-bold">{req.method}</span>
+                  <span className="text-zinc-200 truncate max-w-xs">{req.host || req.subdomain}{req.path}</span>
+                  <span className="text-zinc-500 ml-auto">({req.durationMs}ms)</span>
+                  <span className="text-zinc-400">{req.clientIp}</span>
+                </div>
+              ))
+            )}
           </div>
         </div>
       )}
@@ -319,17 +337,23 @@ export const TerminalUI: React.FC<TerminalUIProps> = ({
         <div className="border border-emerald-900 rounded p-3 bg-[#080d14] space-y-2">
           <div className="text-emerald-300 font-bold">ACME V2 SSL CERTIFICATES</div>
           <div className="space-y-2 text-[11px]">
-            {certificates.map((c) => (
-              <div key={c.id} className="p-2 border border-zinc-800 rounded bg-zinc-950">
-                <div className="flex justify-between font-bold text-white">
-                  <span>{c.domain}</span>
-                  <span className="text-emerald-400">VALID ({c.daysRemaining} days left)</span>
-                </div>
-                <div className="text-zinc-400 text-[10px]">
-                  Issuer: {c.issuer} • Challenge: {c.challengeType} • OCSP: {c.ocspStapled ? 'ENABLED' : 'DISABLED'}
-                </div>
+            {certificates.length === 0 ? (
+              <div className="py-4 text-center text-zinc-500 italic">
+                No SSL certificates issued.
               </div>
-            ))}
+            ) : (
+              certificates.map((c) => (
+                <div key={c.id} className="p-2 border border-zinc-800 rounded bg-zinc-950">
+                  <div className="flex justify-between font-bold text-white">
+                    <span>{c.domain}</span>
+                    <span className="text-emerald-400">VALID ({c.daysRemaining} days left)</span>
+                  </div>
+                  <div className="text-zinc-400 text-[10px]">
+                    Issuer: {c.issuer} • Challenge: {c.challengeType} • OCSP: {c.ocspStapled ? 'ENABLED' : 'DISABLED'}
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         </div>
       )}

@@ -1,0 +1,19 @@
+# Multi-stage Go build for Edge Gateway
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+COPY go.work ./
+COPY gateway/ ./gateway/
+COPY agent/ ./agent/
+
+WORKDIR /app/gateway
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bin/edgeproxy-gateway .
+
+# Final minimal distroless/scratch container
+FROM alpine:3.19
+RUN apk --no-cache add ca-certificates tzdata
+WORKDIR /
+COPY --from=builder /bin/edgeproxy-gateway /usr/local/bin/edgeproxy-gateway
+
+EXPOSE 80 443 4242
+ENTRYPOINT ["/usr/local/bin/edgeproxy-gateway"]

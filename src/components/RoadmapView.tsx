@@ -14,7 +14,7 @@ import {
   ExternalLink,
   ChevronRight
 } from 'lucide-react';
-import { ROADMAP_STAGES } from '../mockData';
+import { ROADMAP_STAGES } from '../data/roadmapData';
 import { RoadmapStage } from '../types';
 
 interface RoadmapViewProps {

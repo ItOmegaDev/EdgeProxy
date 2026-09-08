@@ -39,15 +39,14 @@ export class TrafficEngine {
   private lastRefillTime: number = Date.now();
   private requestCounter: number = 0;
   private droppedCount: number = 0;
-  private latenciesBuffer: number[] = [12, 14, 15, 18, 22, 16, 14, 19, 25, 30];
-  private currentRpsHistory: number[] = [18, 24, 22, 29, 31, 26, 35];
+  private latenciesBuffer: number[] = [];
+  private currentRpsHistory: number[] = [];
   private isAttackActive: boolean = false;
   private attackInterval: any = null;
 
   constructor(initialConfig: RateLimiterConfig, initialTunnels: Tunnel[]) {
     this.config = { ...initialConfig };
     this.tunnels = [...initialTunnels];
-    this.seedInitialRequests();
   }
 
   public getConfig(): RateLimiterConfig {
@@ -226,41 +225,43 @@ export class TrafficEngine {
 
   public getTelemetry(): TelemetryMetrics {
     this.refillTokens();
-    const recent = this.requestsHistory.slice(0, 30);
+    const hasRequests = this.requestsHistory.length > 0;
     const validDurations = [...this.latenciesBuffer].sort((a, b) => a - b);
 
-    const p50 = validDurations[Math.floor(validDurations.length * 0.5)] || 15;
-    const p95 = validDurations[Math.floor(validDurations.length * 0.95)] || 32;
-    const p99 = validDurations[Math.floor(validDurations.length * 0.99)] || 64;
+    const p50 = validDurations.length > 0 ? validDurations[Math.floor(validDurations.length * 0.5)] : 0;
+    const p95 = validDurations.length > 0 ? validDurations[Math.floor(validDurations.length * 0.95)] : 0;
+    const p99 = validDurations.length > 0 ? validDurations[Math.floor(validDurations.length * 0.99)] : 0;
 
     const totalActiveStreams = this.tunnels.reduce((acc, t) => acc + (t.status === 'online' ? t.activeStreams : 0), 0);
 
-    const calcRps = this.isAttackActive
-      ? Math.floor(Math.random() * 250) + 380
-      : Math.floor(Math.random() * 15) + 24;
+    const now = Date.now();
+    const recentOneSec = this.requestsHistory.filter((r) => now - new Date(r.timestamp).getTime() <= 1000);
+    const calcRps = recentOneSec.length;
 
     this.currentRpsHistory.push(calcRps);
     if (this.currentRpsHistory.length > 20) {
       this.currentRpsHistory.shift();
     }
 
-    const peakRps = Math.max(...this.currentRpsHistory, 120);
+    const peakRps = this.currentRpsHistory.length > 0 ? Math.max(...this.currentRpsHistory) : 0;
+    const bytesInLastSec = recentOneSec.reduce((acc, r) => acc + (r.requestHeaders['Content-Length'] ? parseInt(r.requestHeaders['Content-Length']) : 128), 0);
+    const bytesOutLastSec = recentOneSec.reduce((acc, r) => acc + (r.bytes || 0), 0);
 
     return {
       currentRps: calcRps,
       peakRps,
-      activeConnections: totalActiveStreams * 3 + Math.floor(Math.random() * 8),
-      bandwidthInBps: calcRps * 1280,
-      bandwidthOutBps: calcRps * 5800,
+      activeConnections: totalActiveStreams,
+      bandwidthInBps: bytesInLastSec,
+      bandwidthOutBps: bytesOutLastSec,
       p50LatencyMs: parseFloat(p50.toFixed(1)),
       p95LatencyMs: parseFloat(p95.toFixed(1)),
       p99LatencyMs: parseFloat(p99.toFixed(1)),
       droppedRequestsCount: this.droppedCount,
       totalRequestsCount: this.requestCounter,
-      edgeCpuPercent: parseFloat((this.isAttackActive ? Math.random() * 12 + 18 : Math.random() * 3 + 4.2).toFixed(1)),
-      edgeMemoryMb: parseFloat((48.4 + Math.random() * 3.2).toFixed(1)),
-      tunnelJitterMs: parseFloat((Math.random() * 1.5 + 0.4).toFixed(2)),
-      packetLossPercent: parseFloat((this.isAttackActive ? 0.08 : 0.01).toFixed(2)),
+      edgeCpuPercent: hasRequests ? (this.isAttackActive ? 14.2 : 2.8) : 0.4,
+      edgeMemoryMb: 24.5,
+      tunnelJitterMs: hasRequests ? 0.35 : 0.0,
+      packetLossPercent: this.droppedCount > 0 && this.requestCounter > 0 ? parseFloat(((this.droppedCount / this.requestCounter) * 100).toFixed(2)) : 0.0,
     };
   }
 
@@ -269,12 +270,11 @@ export class TrafficEngine {
     this.isAttackActive = true;
 
     this.attackInterval = setInterval(() => {
-      // Fire 5 rapid attack packets per tick
       for (let i = 0; i < 4; i++) {
         const req = this.generateRequest({
           isAttack: true,
           method: Math.random() > 0.4 ? 'POST' : 'GET',
-          customPath: Math.random() > 0.5 ? '/login' : '/api/v1/search?q=' + Math.random(),
+          customPath: '/api/v1/auth/flood',
         });
         onTick(req);
       }
@@ -291,11 +291,5 @@ export class TrafficEngine {
 
   public isAttackRunning(): boolean {
     return this.isAttackActive;
-  }
-
-  private seedInitialRequests() {
-    for (let i = 0; i < 25; i++) {
-      this.generateRequest();
-    }
   }
 }
