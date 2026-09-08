@@ -1,0 +1,6 @@
+{
+  "name": "EdgeProxy & Traffic Mesh",
+  "description": "High-Performance Edge Router and Tunneling Reverse Proxy for local servers, auto-SSL, and DDoS shield",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
