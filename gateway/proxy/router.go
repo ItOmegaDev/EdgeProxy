@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -17,37 +18,95 @@ import (
 	"edgeproxy/gateway/protocol"
 )
 
+// AllowedTunnelConfig holds tunnel permissions synchronized from Control Plane / Database
+type AllowedTunnelConfig struct {
+	Subdomain string  `json:"subdomain"`
+	AuthToken string  `json:"token"`
+	MaxRPS    float64 `json:"maxRps"`
+	IsActive  bool    `json:"isActive"`
+}
+
+// AgentTelemetry represents metrics reported by the agent's local metrics collector
+type AgentTelemetry struct {
+	AgentID         string    `json:"agentId"`
+	Subdomain       string    `json:"subdomain"`
+	Timestamp       time.Time `json:"timestamp"`
+	TotalRequests   uint64    `json:"totalRequests"`
+	ActiveStreams   int32     `json:"activeStreams"`
+	BytesSent       uint64    `json:"bytesSent"`
+	BytesReceived   uint64    `json:"bytesReceived"`
+	AvgLatencyMs    float64   `json:"avgLatencyMs"`
+	P50LatencyMs    float64   `json:"p50LatencyMs"`
+	P95LatencyMs    float64   `json:"p95LatencyMs"`
+	P99LatencyMs    float64   `json:"p99LatencyMs"`
+	ErrorCount      uint64    `json:"errorCount"`
+	LocalServiceRTT float64   `json:"localServiceRttMs"`
+}
+
 // TunnelSession represents an active connected agent
 type TunnelSession struct {
-	ID         string
-	Subdomain  string
-	Conn       net.Conn
-	WriterLock sync.Mutex
-	Streams    map[uint32]chan []byte
-	StreamsMu  sync.RWMutex
-	NextStream uint32
-	CreatedAt  time.Time
-	BytesIn    uint64
-	BytesOut   uint64
+	ID              string
+	Subdomain       string
+	Conn            net.Conn
+	WriterLock      sync.Mutex
+	Streams         map[uint32]chan []byte
+	StreamsMu       sync.RWMutex
+	NextStream      uint32
+	CreatedAt       time.Time
+	BytesIn         uint64
+	BytesOut        uint64
+	LatestTelemetry *AgentTelemetry
 }
 
 // Router maintains active subdomain mappings and proxies incoming TCP/HTTP requests
 type Router struct {
-	mu          sync.RWMutex
-	sessions    map[string]*TunnelSession // key: subdomain
-	rateLimiter *limiter.RateLimiterStore
-	baseDomain  string
+	mu             sync.RWMutex
+	sessions       map[string]*TunnelSession       // key: subdomain
+	allowedTunnels map[string]AllowedTunnelConfig // synchronized from Control Plane / DB
+	rateLimiter    *limiter.RateLimiterStore
+	baseDomain     string
 }
 
 func NewRouter(baseDomain string, rps, burst float64) *Router {
 	return &Router{
-		sessions:    make(map[string]*TunnelSession),
-		rateLimiter: limiter.NewRateLimiterStore(rps, burst),
-		baseDomain:  baseDomain,
+		sessions:       make(map[string]*TunnelSession),
+		allowedTunnels: make(map[string]AllowedTunnelConfig),
+		rateLimiter:    limiter.NewRateLimiterStore(rps, burst),
+		baseDomain:     baseDomain,
 	}
 }
 
-// RegisterSession attaches a new local agent tunnel
+// SyncAllowedTunnels loads or updates allowed tunnels from DB / Control Plane
+func (r *Router) SyncAllowedTunnels(configs []AllowedTunnelConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	newMap := make(map[string]AllowedTunnelConfig)
+	for _, cfg := range configs {
+		newMap[cfg.Subdomain] = cfg
+	}
+	r.allowedTunnels = newMap
+	log.Printf("[ROUTER-SYNC] Synchronized %d authorized tunnels from Control Plane database", len(newMap))
+}
+
+// VerifyAuthorization verifies if agent's token is allowed according to DB state
+func (r *Router) VerifyAuthorization(subdomain, token string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// If no tunnels configured yet in DB, allow initial bootstrap tokens
+	if len(r.allowedTunnels) == 0 {
+		return token != ""
+	}
+
+	cfg, exists := r.allowedTunnels[subdomain]
+	if !exists {
+		return false
+	}
+	return cfg.IsActive && (cfg.AuthToken == "" || cfg.AuthToken == token)
+}
+
+// RegisterSession attaches a new authenticated local agent tunnel
 func (r *Router) RegisterSession(subdomain string, conn net.Conn) *TunnelSession {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -61,7 +120,7 @@ func (r *Router) RegisterSession(subdomain string, conn net.Conn) *TunnelSession
 	}
 
 	r.sessions[subdomain] = session
-	log.Printf("[ROUTER] Registered tunnel session for %s.%s (ID: %s)", subdomain, r.baseDomain, session.ID)
+	log.Printf("[ROUTER] Registered authenticated tunnel session for %s.%s (ID: %s)", subdomain, r.baseDomain, session.ID)
 	return session
 }
 
@@ -77,7 +136,50 @@ func (r *Router) UnregisterSession(subdomain string) {
 	}
 }
 
-// ServeHTTP inspects the Host header and proxies the request through the binary tunnel
+// RecordTelemetry stores real agent metrics received via FrameMetrics
+func (r *Router) RecordTelemetry(subdomain string, data []byte) {
+	var telem AgentTelemetry
+	if err := json.Unmarshal(data, &telem); err != nil {
+		log.Printf("[ROUTER-METRICS] Error decoding telemetry from %s: %v", subdomain, err)
+		return
+	}
+
+	r.mu.RLock()
+	sess, exists := r.sessions[subdomain]
+	r.mu.RUnlock()
+
+	if exists && sess != nil {
+		sess.LatestTelemetry = &telem
+		atomic.StoreUint64(&sess.BytesIn, telem.BytesReceived)
+		atomic.StoreUint64(&sess.BytesOut, telem.BytesSent)
+		log.Printf("[AGENT-TELEMETRY] Subdomain %s: %d reqs, avg lat %.2f ms, active streams: %d",
+			subdomain, telem.TotalRequests, telem.AvgLatencyMs, telem.ActiveStreams)
+	}
+}
+
+// GetActiveSessionsSnapshot returns real telemetry for Control Plane synchronization
+func (r *Router) GetActiveSessionsSnapshot() []map[string]interface{} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make([]map[string]interface{}, 0, len(r.sessions))
+	for sub, sess := range r.sessions {
+		entry := map[string]interface{}{
+			"subdomain": sub,
+			"sessionId": sess.ID,
+			"createdAt": sess.CreatedAt,
+			"bytesIn":   atomic.LoadUint64(&sess.BytesIn),
+			"bytesOut":  atomic.LoadUint64(&sess.BytesOut),
+		}
+		if sess.LatestTelemetry != nil {
+			entry["telemetry"] = sess.LatestTelemetry
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// ServeHTTP inspects Host header and proxies request through the binary tunnel
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	clientIP, _, _ := net.SplitHostPort(req.RemoteAddr)
 	if !r.rateLimiter.Check(clientIP) {
@@ -85,7 +187,6 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Extract subdomain from Host header (e.g., "myapi.edgeproxy.mesh" -> "myapi")
 	host := req.Host
 	if colonIdx := strings.Index(host, ":"); colonIdx != -1 {
 		host = host[:colonIdx]
@@ -96,7 +197,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// Root domain hit
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"service":"EdgeProxy Gateway","status":"online","tunnels_active":%d}`, len(r.sessions))
+		r.mu.RLock()
+		activeCount := len(r.sessions)
+		r.mu.RUnlock()
+		fmt.Fprintf(w, `{"service":"EdgeProxy Gateway","status":"online","tunnels_active":%d,"base_domain":"%s"}`, activeCount, r.baseDomain)
 		return
 	}
 
@@ -109,7 +213,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Allocate a new stream ID with buffered response channel to prevent HOL blocking
+	// Allocate stream ID with buffered channel and explicit credit-based flow control
 	streamID := atomic.AddUint32(&session.NextStream, 1)
 	respChan := make(chan []byte, 128)
 
@@ -123,7 +227,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		session.StreamsMu.Unlock()
 	}()
 
-	// Serialize HTTP request with standard Go req.Write(&buf) ensuring 100% RFC compliance
+	// 100% RFC-compliant serialization using standard Go req.Write(&reqBuf)
 	var reqBuf bytes.Buffer
 	if err := req.Write(&reqBuf); err != nil {
 		http.Error(w, "HTTP 500: Failed serializing HTTP request", http.StatusInternalServerError)
@@ -145,7 +249,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Read initial response payload from agent (first chunk contains headers)
+	// Wait for first response chunk from agent
 	select {
 	case payload, ok := <-respChan:
 		if !ok || len(payload) == 0 {
@@ -153,7 +257,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		// Acknowledge chunk receipt to agent to keep window open
+		// Send FrameAck to release backpressure window credit to agent
 		session.WriterLock.Lock()
 		session.Conn.Write((&protocol.Frame{
 			StreamID: streamID,
@@ -161,7 +265,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}).Encode())
 		session.WriterLock.Unlock()
 
-		// Parse HTTP response header
+		// Parse HTTP headers
 		respReader := bufio.NewReader(bytes.NewReader(payload))
 		resp, pErr := http.ReadResponse(respReader, req)
 		if pErr != nil {
@@ -180,7 +284,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 
-		// Stream any subsequent data chunks (e.g., large files, chunked transfer)
+		// Stream subsequent data chunks with windowed FrameAck backpressure
 		for chunk := range respChan {
 			if len(chunk) > 0 {
 				w.Write(chunk)
@@ -188,6 +292,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 					f.Flush()
 				}
 			}
+			// Acknowledge chunk consumption immediately to maintain window credit without deadlock
 			session.WriterLock.Lock()
 			session.Conn.Write((&protocol.Frame{
 				StreamID: streamID,

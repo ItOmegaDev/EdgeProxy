@@ -13,5 +13,8 @@ service cloud.firestore {
     match /rate_limit_rules/{ruleId} {
       allow read, write: if true;
     }
+    match /certificates/{certId} {
+      allow read, write: if true;
+    }
   }
 }

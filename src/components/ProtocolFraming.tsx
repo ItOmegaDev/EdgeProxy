@@ -130,6 +130,10 @@ export const ProtocolFraming: React.FC<ProtocolFramingProps> = ({ language }) =>
       DATA: 0x02,
       FIN: 0x03,
       PING: 0x04,
+      PONG: 0x05,
+      RST: 0x06,
+      ACK: 0x07,
+      METRICS: 0x08,
     };
 
     const typeCode = typeCodeMap[customType];

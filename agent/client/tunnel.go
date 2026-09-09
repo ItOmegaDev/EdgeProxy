@@ -10,19 +10,25 @@ import (
 	"time"
 
 	"edgeproxy/agent/demux"
+	"edgeproxy/agent/metrics"
 )
 
 // Header size: 9 bytes
 const HeaderSize = 9
 
 const (
-	FrameSyn  byte = 0x01
-	FrameData byte = 0x02
-	FrameFin  byte = 0x03
-	FramePing byte = 0x04
-	FramePong byte = 0x05
-	FrameAck  byte = 0x07
+	FrameSyn     byte = 0x01
+	FrameData    byte = 0x02
+	FrameFin     byte = 0x03
+	FramePing    byte = 0x04
+	FramePong    byte = 0x05
+	FrameRst     byte = 0x06
+	FrameAck     byte = 0x07
+	FrameMetrics byte = 0x08
 )
+
+// MaxInFlightWindow defines max unacknowledged 32KB chunks per stream for backpressure
+const MaxInFlightWindow = 4
 
 type TunnelClient struct {
 	gatewayAddr string
@@ -30,18 +36,26 @@ type TunnelClient struct {
 	localPort   int
 	token       string
 	demuxer     *demux.StreamDemuxer
+	collector   *metrics.LocalMetricsCollector
 	conn        net.Conn
 	mu          sync.Mutex
 	running     bool
+
+	// Flow control credit map: streamID -> channel of ACK pulses
+	ackChans   map[uint32]chan struct{}
+	ackChansMu sync.RWMutex
 }
 
 func NewTunnelClient(gatewayAddr, subdomain string, localPort int, token string) *TunnelClient {
+	agentID := fmt.Sprintf("agent-%s-%d", subdomain, time.Now().Unix())
 	return &TunnelClient{
 		gatewayAddr: gatewayAddr,
 		subdomain:   subdomain,
 		localPort:   localPort,
 		token:       token,
 		demuxer:     demux.NewStreamDemuxer(fmt.Sprintf("127.0.0.1:%d", localPort)),
+		collector:   metrics.NewMetricsCollector(agentID, subdomain),
+		ackChans:    make(map[uint32]chan struct{}),
 	}
 }
 
@@ -56,8 +70,9 @@ func (c *TunnelClient) Start() error {
 	c.conn = conn
 	c.running = true
 
-	// Handshake: send SYN frame with requested subdomain
-	handshakeFrame := encodeFrame(0, FrameSyn, []byte(c.subdomain))
+	// Handshake: send SYN frame with JSON handshake payload containing subdomain + auth token
+	handshakePayload := fmt.Sprintf(`{"subdomain":"%s","token":"%s","version":"v1.0.0-PROD"}`, c.subdomain, c.token)
+	handshakeFrame := encodeFrame(0, FrameSyn, []byte(handshakePayload))
 	if _, err := c.conn.Write(handshakeFrame); err != nil {
 		return fmt.Errorf("handshake write failed: %w", err)
 	}
@@ -66,6 +81,9 @@ func (c *TunnelClient) Start() error {
 
 	// Keep-alive heartbeat loop
 	go c.heartbeatLoop()
+
+	// Periodic telemetry collector loop sending FrameMetrics
+	go c.telemetryLoop()
 
 	// Frame read and processing loop
 	for c.running {
@@ -77,34 +95,85 @@ func (c *TunnelClient) Start() error {
 			break
 		}
 
-		if frameType == FramePing {
+		switch frameType {
+		case FramePing:
 			c.mu.Lock()
 			c.conn.Write(encodeFrame(streamID, FramePong, nil))
 			c.mu.Unlock()
-			continue
-		}
 
-		if frameType == FrameSyn || frameType == FrameData {
-			// Asynchronously forward to local port, chunk response and stream back
+		case FrameAck:
+			// Release backpressure credit for the corresponding stream
+			c.ackChansMu.RLock()
+			ch, exists := c.ackChans[streamID]
+			c.ackChansMu.RUnlock()
+			if exists && ch != nil {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			}
+
+		case FrameSyn, FrameData:
+			c.collector.StreamStarted()
+			// Asynchronously forward to local port with flow control window
 			go func(sid uint32, raw []byte) {
+				defer c.collector.StreamFinished()
+
+				startTime := time.Now()
 				respBytes, err := c.demuxer.ForwardRequest(raw)
+				duration := time.Since(startTime)
+
 				if err != nil {
+					c.collector.RecordRequest(duration, int64(len(raw)), 0, 502)
+					// Send FrameRst to notify gateway of local error
+					c.mu.Lock()
+					c.conn.Write(encodeFrame(sid, FrameRst, []byte(err.Error())))
+					c.mu.Unlock()
 					return
 				}
 
-				// Chunk response in 32KB pieces to prevent buffer saturation
+				c.collector.RecordRequest(duration, int64(len(raw)), int64(len(respBytes)), 200)
+
+				// Register ACK credit channel for flow control
+				ackChan := make(chan struct{}, MaxInFlightWindow)
+				// Preload initial credit window
+				for i := 0; i < MaxInFlightWindow; i++ {
+					ackChan <- struct{}{}
+				}
+
+				c.ackChansMu.Lock()
+				c.ackChans[sid] = ackChan
+				c.ackChansMu.Unlock()
+
+				defer func() {
+					c.ackChansMu.Lock()
+					delete(c.ackChans, sid)
+					c.ackChansMu.Unlock()
+				}()
+
+				// Stream response in 32KB chunks with windowed credit backpressure
 				const chunkSize = 32768
 				for offset := 0; offset < len(respBytes); offset += chunkSize {
 					end := offset + chunkSize
 					if end > len(respBytes) {
 						end = len(respBytes)
 					}
+
+					// Wait for flow control credit (prevents deadlock on large 10MB+ transfers)
+					select {
+					case <-ackChan:
+						// Credit available, transmit chunk
+					case <-time.After(10 * time.Second):
+						log.Printf("[AGENT-BACKPRESSURE] Flow control window timeout for stream %d", sid)
+						return
+					}
+
 					c.mu.Lock()
 					c.conn.Write(encodeFrame(sid, FrameData, respBytes[offset:end]))
 					c.mu.Unlock()
 				}
 
-				// Send FrameFin to signal end of stream to gateway
+				// Signal stream completion with FrameFin
 				c.mu.Lock()
 				c.conn.Write(encodeFrame(sid, FrameFin, nil))
 				c.mu.Unlock()
@@ -113,6 +182,23 @@ func (c *TunnelClient) Start() error {
 	}
 
 	return nil
+}
+
+func (c *TunnelClient) telemetryLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for c.running {
+		<-ticker.C
+		reportBytes, err := c.collector.EncodeJSON()
+		if err == nil && len(reportBytes) > 0 {
+			c.mu.Lock()
+			if c.conn != nil {
+				c.conn.Write(encodeFrame(0, FrameMetrics, reportBytes))
+			}
+			c.mu.Unlock()
+		}
+	}
 }
 
 func (c *TunnelClient) heartbeatLoop() {

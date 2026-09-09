@@ -68,6 +68,27 @@
         "updated_at": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "capacity", "refill_rate"]
+    },
+    "Certificate": {
+      "title": "Certificate",
+      "description": "TLS X.509 certificates and ACME renewal state",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "domain": { "type": "string" },
+        "wildcard": { "type": "boolean" },
+        "issuer": { "type": "string" },
+        "status": { "type": "string" },
+        "valid_from": { "type": "string" },
+        "valid_to": { "type": "string" },
+        "days_remaining": { "type": "number" },
+        "challenge_type": { "type": "string" },
+        "san_list": { "type": "array" },
+        "ocsp_stapled": { "type": "boolean" },
+        "fingerprint": { "type": "string" },
+        "auto_renew": { "type": "boolean" }
+      },
+      "required": ["id", "domain", "status", "fingerprint"]
     }
   },
   "firestore": {
@@ -86,6 +107,10 @@
     "/rate_limit_rules/{ruleId}": {
       "schema": "RateLimitRule",
       "description": "DDoS and rate limiting bucket rules"
+    },
+    "/certificates/{certId}": {
+      "schema": "Certificate",
+      "description": "TLS Certificates managed by ACME engine"
     }
   }
 }

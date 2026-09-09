@@ -101,7 +101,7 @@ export interface SSLCertificate {
   validFrom: string;
   validTo: string;
   daysRemaining: number;
-  challengeType: 'DNS-01' | 'HTTP-01';
+  challengeType: 'DNS-01' | 'HTTP-01' | 'TLS-ALPN-01';
   sanList: string[];
   ocspStapled: boolean;
   fingerprint: string;
@@ -119,7 +119,7 @@ export interface LocalDiscoveryItem {
 }
 
 // Section 3: Tunnel Binary Frame Protocol Types
-export type BinaryFrameType = 'SYN' | 'DATA' | 'FIN' | 'PING';
+export type BinaryFrameType = 'SYN' | 'DATA' | 'FIN' | 'PING' | 'PONG' | 'RST' | 'ACK' | 'METRICS';
 
 export interface BinaryFrame {
   id: string;

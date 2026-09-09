@@ -53,7 +53,10 @@ func (d *StreamDemuxer) ForwardRequest(rawReq []byte) ([]byte, error) {
 	defer resp.Body.Close()
 
 	var buf bytes.Buffer
-	resp.Write(&buf)
+	if err := resp.Write(&buf); err != nil {
+		log.Printf("[DEMUX] Error serializing HTTP response with resp.Write: %v", err)
+		return nil, fmt.Errorf("failed serializing HTTP response: %w", err)
+	}
 
 	log.Printf("[DEMUX] %s %s -> %d %s (local: %v)", req.Method, req.URL.Path, resp.StatusCode, http.StatusText(resp.StatusCode), duration)
 	return buf.Bytes(), nil

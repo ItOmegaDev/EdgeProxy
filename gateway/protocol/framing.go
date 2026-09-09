@@ -17,8 +17,9 @@ const (
 	FrameFin  byte = 0x03 // Stream close
 	FramePing byte = 0x04 // Keep-alive ping
 	FramePong byte = 0x05 // Keep-alive pong
-	FrameRst  byte = 0x06 // Stream abort/reset
-	FrameAck  byte = 0x07 // Window/credit acknowledgement for flow control
+	FrameRst     byte = 0x06 // Stream abort/reset
+	FrameAck     byte = 0x07 // Window/credit acknowledgement for flow control
+	FrameMetrics byte = 0x08 // Agent local telemetry metrics report
 )
 
 var (

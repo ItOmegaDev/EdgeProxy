@@ -78,13 +78,18 @@ export const CoreCodeExplorer: React.FC<CoreCodeExplorerProps> = ({ language }) 
       badge: 'Go Gateway Ingress',
     },
     'gateway/proxy/router.go': {
-      ua: 'HTTP/TCP маршрутизатор: парсить заголовок Host, виділяє субдомен і мультиплексує запит у бінарний тунель.',
-      en: 'Host-based HTTP/TCP router: inspects Host headers and multiplexes streams into active agent sessions.',
-      badge: 'Zero-Copy Router',
+      ua: 'HTTP/TCP маршрутизатор: стандартизована серіалізація через req.Write(&buf), парсинг Host-заголовка та мультиплексування в бінарний тунель.',
+      en: 'HTTP/TCP router: RFC-compliant serialization via req.Write(&buf), Host header inspection, and multiplexed binary tunneling.',
+      badge: 'RFC req.Write Router',
+    },
+    'gateway/acme/cert.go': {
+      ua: 'ACME & TLS Termination менеджер: генерація криптографічних ECDSA P-256 ключів, dynamic SNI GetCertificate та TLS-ALPN-01 автооновлення.',
+      en: 'ACME & TLS Termination: cryptographic ECDSA P-256 X.509 cert generator with SNI GetCertificate handler and auto-renewal.',
+      badge: 'TLS Termination / ACME',
     },
     'gateway/protocol/framing.go': {
-      ua: '9-байтний бінарний протокол: [StreamID: 4B, Type: 1B, Len: 4B]. Запобігає блокуванню рядка (HOL blocking).',
-      en: '9-byte framed binary wire protocol: eliminates Head-of-line blocking with async virtual streams.',
+      ua: '9-байтний бінарний протокол: [StreamID: 4B, Type: 1B, Len: 4B]. Підтримує FrameAck для flow control та FrameMetrics для телеметрії.',
+      en: '9-byte binary wire protocol with FrameAck sliding-window flow control and FrameMetrics telemetry streaming.',
       badge: 'Binary Wire Protocol',
     },
     'gateway/limiter/bucket.go': {
@@ -93,14 +98,19 @@ export const CoreCodeExplorer: React.FC<CoreCodeExplorerProps> = ({ language }) 
       badge: 'DDoS Shield',
     },
     'agent/main.go': {
-      ua: 'CLI клієнт для локального розробника. Має прапорці --port, --subdomain та автовиявлення локальних портів.',
-      en: 'Standalone CLI agent with port auto-discovery and automatic gateway reconnection.',
+      ua: 'CLI клієнт для локального розробника. Обов\'язковий прапорець -token, --port, --subdomain та перевірка аутентифікації.',
+      en: 'Standalone CLI agent with mandatory token authentication, port auto-discovery and graceful termination.',
       badge: 'Go CLI Agent',
     },
     'agent/client/tunnel.go': {
-      ua: 'Клієнтський транспорт тунелю: підтримує довготривале TCP з\'єднання, PING/PONG keep-alive та демультиплексування.',
-      en: 'Client tunnel transport maintaining long-lived TCP/QUIC connection with keep-alive heartbeat.',
-      badge: 'Tunnel Transport',
+      ua: 'Клієнтський транспорт тунелю: Backpressure flow control через FrameAck, періодична відправка FrameMetrics телеметрії.',
+      en: 'Tunnel client transport with sliding-window FrameAck backpressure and periodic FrameMetrics telemetry dispatch.',
+      badge: 'Flow-Controlled Transport',
+    },
+    'agent/metrics/collector.go': {
+      ua: 'Local Metrics Collector: агрегатор затримки (P50/P95/P99), кількості запитів, переданих байтів та відліку RTT локального сервісу.',
+      en: 'Local Metrics Collector aggregating P50/P95/P99 latency, byte counts, active streams, and local service RTT.',
+      badge: 'Metrics Collector',
     },
     'agent/demux/demuxer.go': {
       ua: 'Локальний реверс-проксі: приймає запити з віртуальних потоків і перенаправляє на localhost:3000.',
@@ -127,10 +137,12 @@ export const CoreCodeExplorer: React.FC<CoreCodeExplorerProps> = ({ language }) 
   const fileList = Object.keys(files).length > 0 ? Object.keys(files) : [
     'gateway/main.go',
     'gateway/proxy/router.go',
+    'gateway/acme/cert.go',
     'gateway/protocol/framing.go',
     'gateway/limiter/bucket.go',
     'agent/main.go',
     'agent/client/tunnel.go',
+    'agent/metrics/collector.go',
     'agent/demux/demuxer.go',
     'db/01_schema.sql',
     'db/02_indexes.sql',

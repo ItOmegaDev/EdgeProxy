@@ -327,6 +327,29 @@ export function dbGetStatus() {
     projectId: activeProjectId || 'influential-graph-nj1d7',
     databaseId: activeDatabaseId || 'ai-studio-edgeproxytraffic-8ae9f396-b7a2-4678-b3cb-c06f9bd459fd',
     status: isFirestoreReady ? 'connected' : 'initializing',
-    collections: ['tunnels', 'traffic_logs', 'users', 'rate_limit_rules']
+    collections: ['tunnels', 'traffic_logs', 'users', 'rate_limit_rules', 'certificates']
   };
+}
+
+export async function dbGetCertificates(): Promise<any[]> {
+  if (isFirestoreReady && firestoreDb) {
+    try {
+      const colRef = collection(firestoreDb, 'certificates');
+      const snap = await getDocs(colRef);
+      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    } catch (err: any) {
+      console.warn('[Firebase Firestore] Failed fetching certificates:', err.message);
+    }
+  }
+  return [];
+}
+
+export async function dbSaveCertificate(cert: any): Promise<void> {
+  if (isFirestoreReady && firestoreDb && cert && cert.id) {
+    try {
+      await setDoc(doc(firestoreDb, 'certificates', cert.id), cert);
+    } catch (err: any) {
+      console.warn('[Firebase Firestore] Failed saving certificate:', err.message);
+    }
+  }
 }
