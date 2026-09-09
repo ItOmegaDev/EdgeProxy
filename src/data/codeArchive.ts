@@ -389,16 +389,13 @@ func main() {
 	gatewayAddr := flag.String("gateway", "gateway.edgeproxy.mesh:4242", "Edge Gateway TCP wire address")
 	subdomain := flag.String("subdomain", "", "Requested custom subdomain")
 	port := flag.Int("port", 3000, "Target local port to expose")
-	token := flag.String("token", "", "EdgeProxy auth token (required, or set EDGEPROXY_AUTH_TOKEN)")
+	token := flag.String("token", "", "EdgeProxy auth token (strictly required)")
 	flag.Parse()
 
+	if *token == "" {
+		log.Fatal("[FATAL] Missing required auth token. Pass -token <token>.")
+	}
 	authToken := *token
-	if authToken == "" {
-		authToken = os.Getenv("EDGEPROXY_AUTH_TOKEN")
-	}
-	if authToken == "" {
-		log.Fatal("[FATAL] Missing required auth token. Pass -token <token> or set EDGEPROXY_AUTH_TOKEN.")
-	}
 
 	if *subdomain == "" {
 		*subdomain = fmt.Sprintf("dev-%d", time.Now().Unix()%10000)

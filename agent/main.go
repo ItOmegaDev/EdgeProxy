@@ -17,18 +17,15 @@ func main() {
 	gatewayAddr := flag.String("gateway", "gateway.edgeproxy.mesh:4242", "Edge Gateway TCP control plane address")
 	subdomain := flag.String("subdomain", "", "Requested custom subdomain (e.g. 'myapi')")
 	port := flag.Int("port", 3000, "Target local port to expose (e.g. 3000, 8080)")
-	token := flag.String("token", "", "EdgeProxy auth token (required, or set EDGEPROXY_AUTH_TOKEN)")
+	token := flag.String("token", "", "EdgeProxy auth token (strictly required)")
 	autoDiscover := flag.Bool("auto", true, "Auto-discover active listening ports if port is closed")
 	flag.Parse()
 
-	// Strict token enforcement: prohibit hardcoded or empty tokens
+	// Strict token enforcement: flag is strictly mandatory
+	if *token == "" {
+		log.Fatal("[FATAL] Missing required auth token. Pass -token <token>.")
+	}
 	authToken := *token
-	if authToken == "" {
-		authToken = os.Getenv("EDGEPROXY_AUTH_TOKEN")
-	}
-	if authToken == "" {
-		log.Fatal("[FATAL] Missing required auth token. Pass -token <token> or set EDGEPROXY_AUTH_TOKEN environment variable.")
-	}
 
 	if *subdomain == "" {
 		*subdomain = fmt.Sprintf("dev-%d", time.Now().Unix()%10000)

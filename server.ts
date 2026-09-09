@@ -234,7 +234,32 @@ app.get("/api/status", (req, res) => {
 });
 
 // Tunnels CRUD
-app.get("/api/tunnels", (req, res) => {
+app.get("/api/tunnels", async (req, res) => {
+  if (tunnels.length === 0) {
+    const dbTuns = await dbGetTunnels();
+    if (dbTuns && dbTuns.length > 0) {
+      dbTuns.forEach((t) => {
+        if (!tunnels.some((existing) => existing.subdomain === t.subdomain)) {
+          tunnels.push({
+            id: t.id,
+            name: `Tunnel ${t.subdomain}`,
+            subdomain: t.subdomain,
+            localPort: t.target_port || 3000,
+            protocol: t.protocol || "quic",
+            status: t.is_active ? "online" : "offline",
+            tlsStatus: t.tls_status || "active",
+            authEnabled: Boolean(t.auth_enabled),
+            authUser: t.auth_user || undefined,
+            totalRequests: t.total_requests || 0,
+            bytesTransferred: t.bytes_transferred || 0,
+            avgLatency: t.avg_latency || 0,
+            publicUrl: `https://${t.subdomain}.edgeproxy.mesh`,
+            createdAt: t.created_at || new Date().toISOString(),
+          });
+        }
+      });
+    }
+  }
   res.json(tunnels);
 });
 
@@ -491,13 +516,19 @@ app.post("/api/traffic/simulate", async (req, res) => {
     return res.status(429).json({ success: false, log: entry, reason: limitCheck.reason });
   }
 
-  // Real HTTP probe to local port
+  // Ingress probe to Go Gateway data plane (Port 80/8080 with Subdomain Host header).
+  // Node.js is strictly the Control Plane and does NOT proxy directly to localPort.
+  const gatewayPort = 80;
   const probeReq = http.request(
     {
       hostname: "127.0.0.1",
-      port: targetTunnel.localPort,
+      port: gatewayPort,
       path: reqPath,
       method: method.toUpperCase(),
+      headers: {
+        Host: `${targetTunnel.subdomain}.edgeproxy.mesh`,
+        "X-Forwarded-For": clientIp,
+      },
       timeout: 2500,
     },
     (probeRes) => {
@@ -521,7 +552,7 @@ app.post("/api/traffic/simulate", async (req, res) => {
           blockedByShield: false,
         };
         recordRequest(entry);
-        res.json({ success: true, log: entry });
+        res.json({ success: true, log: entry, routedVia: "Go Ingress Gateway (Port 80)" });
       });
     }
   );
@@ -542,7 +573,7 @@ app.post("/api/traffic/simulate", async (req, res) => {
       blockedByShield: false,
     };
     recordRequest(entry);
-    res.json({ success: false, log: entry, error: "Local port not reachable" });
+    res.json({ success: false, log: entry, error: "Go Ingress Gateway (port 80) / multiplexer wire unreachable", routedVia: "Go Ingress Gateway" });
   });
 
   probeReq.end();
