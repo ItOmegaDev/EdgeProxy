@@ -18,6 +18,7 @@ const (
 	FramePing byte = 0x04 // Keep-alive ping
 	FramePong byte = 0x05 // Keep-alive pong
 	FrameRst  byte = 0x06 // Stream abort/reset
+	FrameAck  byte = 0x07 // Window/credit acknowledgement for flow control
 )
 
 var (

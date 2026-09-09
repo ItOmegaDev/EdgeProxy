@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"time"
 
 	"edgeproxy/gateway/limiter"
@@ -93,6 +92,7 @@ func handleAgentConnection(conn net.Conn, router *proxy.Router) {
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -163,10 +163,17 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		session.StreamsMu.Unlock()
 	}()
 
+	// Serialize HTTP request with standard Go req.Write(&buf) ensuring 100% RFC compliance
+	var reqBuf bytes.Buffer
+	if err := req.Write(&reqBuf); err != nil {
+		http.Error(w, "HTTP 500: Failed serializing HTTP request", http.StatusInternalServerError)
+		return
+	}
+
 	synFrame := &protocol.Frame{
 		StreamID: streamID,
 		Type:     protocol.FrameSyn,
-		Payload:  []byte(fmt.Sprintf("%s %s %s\\r\\nHost: %s\\r\\n\\r\\n", req.Method, req.URL.RequestURI(), req.Proto, req.Host)),
+		Payload:  reqBuf.Bytes(),
 	}
 
 	session.WriterLock.Lock()
@@ -174,11 +181,22 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	session.WriterLock.Unlock()
 
 	select {
-	case payload := <-respChan:
-		respReader := bufio.NewReader(strings.NewReader(string(payload)))
+	case payload, ok := <-respChan:
+		if !ok || len(payload) == 0 {
+			http.Error(w, "HTTP 502: Bad Gateway (Empty response)", http.StatusBadGateway)
+			return
+		}
+
+		// Acknowledge receipt to local agent
+		session.WriterLock.Lock()
+		session.Conn.Write((&protocol.Frame{StreamID: streamID, Type: protocol.FrameAck}).Encode())
+		session.WriterLock.Unlock()
+
+		respReader := bufio.NewReader(bytes.NewReader(payload))
 		parsedResp, err := http.ReadResponse(respReader, req)
 		if err != nil {
-			http.Error(w, "502 Bad Gateway from local agent", http.StatusBadGateway)
+			w.WriteHeader(http.StatusOK)
+			w.Write(payload)
 			return
 		}
 		for k, vv := range parsedResp.Header {
@@ -188,7 +206,18 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		w.WriteHeader(parsedResp.StatusCode)
 		io.Copy(w, parsedResp.Body)
-	case <-time.After(10 * time.Second):
+
+		// Stream subsequent chunks with flow-control ACKs
+		for chunk := range respChan {
+			if len(chunk) > 0 {
+				w.Write(chunk)
+			}
+			session.WriterLock.Lock()
+			session.Conn.Write((&protocol.Frame{StreamID: streamID, Type: protocol.FrameAck}).Encode())
+			session.WriterLock.Unlock()
+		}
+
+	case <-time.After(15 * time.Second):
 		http.Error(w, "504 Gateway Timeout: Agent response timed out", http.StatusGatewayTimeout)
 	}
 }`,
@@ -209,6 +238,8 @@ const (
 	FrameFin  byte = 0x03 // Stream closed
 	FramePing byte = 0x04 // Keep-alive heartbeat
 	FramePong byte = 0x05 // Keep-alive response
+	FrameRst  byte = 0x06 // Stream reset
+	FrameAck  byte = 0x07 // Flow-control acknowledgement
 )
 
 type Frame struct {
@@ -390,12 +421,20 @@ func main() {
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"time"
 
-	"edgeproxy/gateway/protocol"
+	"edgeproxy/agent/demux"
+)
+
+const (
+	FrameSyn  byte = 0x01
+	FrameData byte = 0x02
+	FrameFin  byte = 0x03
+	FramePing byte = 0x04
+	FramePong byte = 0x05
+	FrameAck  byte = 0x07
 )
 
 type TunnelClient struct {
@@ -403,6 +442,7 @@ type TunnelClient struct {
 	subdomain   string
 	localPort   int
 	token       string
+	demuxer     *demux.StreamDemuxer
 	conn        net.Conn
 	mu          sync.Mutex
 	running     bool
@@ -414,6 +454,7 @@ func NewTunnelClient(gatewayAddr, subdomain string, localPort int, token string)
 		subdomain:   subdomain,
 		localPort:   localPort,
 		token:       token,
+		demuxer:     demux.NewStreamDemuxer(fmt.Sprintf("127.0.0.1:%d", localPort)),
 		running:     true,
 	}
 }
@@ -428,43 +469,45 @@ func (tc *TunnelClient) Start() {
 		tc.conn = conn
 
 		// Handshake
-		syn := &protocol.Frame{
-			StreamID: 0,
-			Type:     protocol.FrameSyn,
-			Payload:  []byte(tc.subdomain),
-		}
-		conn.Write(syn.Encode())
+		conn.Write(encodeFrame(0, FrameSyn, []byte(tc.subdomain)))
 
 		// Read multiplexed frames from gateway and forward to local port
 		for tc.running {
-			frame, err := protocol.ReadFrame(conn)
+			streamID, frameType, payload, err := readFrame(conn)
 			if err != nil {
 				break
 			}
-			go tc.handleVirtualStream(frame)
+			if frameType == FramePing {
+				tc.mu.Lock()
+				tc.conn.Write(encodeFrame(streamID, FramePong, nil))
+				tc.mu.Unlock()
+				continue
+			}
+			if frameType == FrameSyn || frameType == FrameData {
+				go func(sid uint32, raw []byte) {
+					respBytes, err := tc.demuxer.ForwardRequest(raw)
+					if err != nil {
+						return
+					}
+					// Chunk response in 32KB pieces
+					const chunkSize = 32768
+					for offset := 0; offset < len(respBytes); offset += chunkSize {
+						end := offset + chunkSize
+						if end > len(respBytes) {
+							end = len(respBytes)
+						}
+						tc.mu.Lock()
+						tc.conn.Write(encodeFrame(sid, FrameData, respBytes[offset:end]))
+						tc.mu.Unlock()
+					}
+					// Finish stream
+					tc.mu.Lock()
+					tc.conn.Write(encodeFrame(sid, FrameFin, nil))
+					tc.mu.Unlock()
+				}(streamID, payload)
+			}
 		}
 	}
-}
-
-func (tc *TunnelClient) handleVirtualStream(f *protocol.Frame) {
-	localConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", tc.localPort))
-	if err != nil {
-		return
-	}
-	defer localConn.Close()
-
-	localConn.Write(f.Payload)
-	buf := make([]byte, 16384)
-	n, _ := localConn.Read(buf)
-
-	respFrame := &protocol.Frame{
-		StreamID: f.StreamID,
-		Type:     protocol.FrameData,
-		Payload:  buf[:n],
-	}
-	tc.mu.Lock()
-	tc.conn.Write(respFrame.Encode())
-	tc.mu.Unlock()
 }
 
 func (tc *TunnelClient) Stop() {
@@ -558,7 +601,7 @@ CREATE INDEX idx_traffic_blocked_ip ON traffic_logs (client_ip, recorded_at DESC
 
   'db/03_seed.sql': `-- Bootstrap Seed Migration
 INSERT INTO users (id, email, api_key, plan_tier, max_tunnels, max_rps)
-VALUES ('00000000-0000-0000-0000-000000000001', 'admin@edgeproxy.mesh', 'edg_live_sec_prod_99x', 'enterprise', 50, 1000)
+VALUES ('00000000-0000-0000-0000-000000000001', 'admin@edgeproxy.mesh', 'edg_sec_09a47f12e8b6c43d91', 'enterprise', 50, 1000)
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO tunnels (id, user_id, subdomain, target_port, protocol, status)

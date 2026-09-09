@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -122,17 +123,17 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		session.StreamsMu.Unlock()
 	}()
 
-	// Serialize the HTTP request to send via Framed protocol
-	rawReq := fmt.Sprintf("%s %s %s\r\nHost: %s\r\n", req.Method, req.URL.RequestURI(), req.Proto, req.Host)
-	for k, v := range req.Header {
-		rawReq += fmt.Sprintf("%s: %s\r\n", k, strings.Join(v, ", "))
+	// Serialize HTTP request with standard Go req.Write(&buf) ensuring 100% RFC compliance
+	var reqBuf bytes.Buffer
+	if err := req.Write(&reqBuf); err != nil {
+		http.Error(w, "HTTP 500: Failed serializing HTTP request", http.StatusInternalServerError)
+		return
 	}
-	rawReq += "\r\n"
 
 	synFrame := &protocol.Frame{
 		StreamID: streamID,
 		Type:     protocol.FrameSyn,
-		Payload:  []byte(rawReq),
+		Payload:  reqBuf.Bytes(),
 	}
 
 	session.WriterLock.Lock()
@@ -144,48 +145,57 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Read and forward request body if present
-	if req.Body != nil {
-		buf := make([]byte, 16384)
-		for {
-			n, rErr := req.Body.Read(buf)
-			if n > 0 {
-				dataFrame := &protocol.Frame{
-					StreamID: streamID,
-					Type:     protocol.FrameData,
-					Payload:  buf[:n],
-				}
-				session.WriterLock.Lock()
-				session.Conn.Write(dataFrame.Encode())
-				session.WriterLock.Unlock()
-			}
-			if rErr == io.EOF {
-				break
-			}
-			if rErr != nil {
-				break
-			}
-		}
-	}
-
-	// Wait for response payload from agent
+	// Read initial response payload from agent (first chunk contains headers)
 	select {
-	case payload := <-respChan:
-		// Parse HTTP response header and stream back
-		respReader := bufio.NewReader(strings.NewReader(string(payload)))
+	case payload, ok := <-respChan:
+		if !ok || len(payload) == 0 {
+			http.Error(w, "HTTP 502: Bad Gateway (Empty response from agent)", http.StatusBadGateway)
+			return
+		}
+
+		// Acknowledge chunk receipt to agent to keep window open
+		session.WriterLock.Lock()
+		session.Conn.Write((&protocol.Frame{
+			StreamID: streamID,
+			Type:     protocol.FrameAck,
+		}).Encode())
+		session.WriterLock.Unlock()
+
+		// Parse HTTP response header
+		respReader := bufio.NewReader(bytes.NewReader(payload))
 		resp, pErr := http.ReadResponse(respReader, req)
 		if pErr != nil {
 			w.WriteHeader(http.StatusOK)
 			w.Write(payload)
-			return
-		}
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				w.Header().Add(k, v)
+		} else {
+			for k, vv := range resp.Header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
 			}
 		}
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+
+		// Stream any subsequent data chunks (e.g., large files, chunked transfer)
+		for chunk := range respChan {
+			if len(chunk) > 0 {
+				w.Write(chunk)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+			session.WriterLock.Lock()
+			session.Conn.Write((&protocol.Frame{
+				StreamID: streamID,
+				Type:     protocol.FrameAck,
+			}).Encode())
+			session.WriterLock.Unlock()
+		}
+
 	case <-time.After(15 * time.Second):
 		http.Error(w, "HTTP 504: Gateway Timeout (Local Agent did not respond)", http.StatusGatewayTimeout)
 	}

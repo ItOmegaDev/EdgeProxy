@@ -8,6 +8,15 @@ import os from "os";
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+import {
+  initDb,
+  executeQuery,
+  dbGetTunnels,
+  dbInsertTunnel,
+  dbDeleteTunnel,
+  dbInsertTrafficLog,
+  dbGetStatus,
+} from "./src/server/db";
 
 const PORT = 3000;
 const app = express();
@@ -124,6 +133,9 @@ function recordRequest(entry: LogEntry) {
   if (logs.length > 500) logs.pop();
   requestTimestamps.push(Date.now());
 
+  // Persist to PostgreSQL / Relational DB
+  dbInsertTrafficLog(entry);
+
   // Update tunnel stats
   const tun = tunnels.find((t) => t.subdomain === entry.subdomain);
   if (tun) {
@@ -216,6 +228,7 @@ app.get("/api/status", (req, res) => {
     tunnelsCount: tunnels.length,
     activeStreams: tunnels.filter((t) => t.status === "online").length,
     rps: telemetry.rps,
+    database: dbGetStatus(),
     telemetry,
   });
 });
@@ -225,7 +238,7 @@ app.get("/api/tunnels", (req, res) => {
   res.json(tunnels);
 });
 
-app.post("/api/tunnels", (req, res) => {
+app.post("/api/tunnels", async (req, res) => {
   const { name, subdomain, localPort, protocol, authEnabled, authUser } = req.body;
 
   if (!subdomain || !localPort) {
@@ -254,18 +267,31 @@ app.post("/api/tunnels", (req, res) => {
     createdAt: new Date().toISOString(),
   };
 
+  // Persist to Database
+  await dbInsertTunnel({
+    id: newTunnel.id,
+    subdomain: newTunnel.subdomain,
+    target_port: newTunnel.localPort,
+    protocol: newTunnel.protocol,
+    tls_status: newTunnel.tlsStatus,
+    auth_enabled: newTunnel.authEnabled,
+    auth_user: newTunnel.authUser,
+    is_active: true,
+  });
+
   tunnels.unshift(newTunnel);
   broadcastWs("tunnel_created", newTunnel);
   res.status(201).json(newTunnel);
 });
 
-app.delete("/api/tunnels/:id", (req, res) => {
+app.delete("/api/tunnels/:id", async (req, res) => {
   const { id } = req.params;
   const idx = tunnels.findIndex((t) => t.id === id);
   if (idx === -1) {
     return res.status(404).json({ error: "Tunnel not found" });
   }
   const deleted = tunnels.splice(idx, 1)[0];
+  await dbDeleteTunnel(deleted.id);
   broadcastWs("tunnel_deleted", { id: deleted.id, subdomain: deleted.subdomain });
   res.json({ message: "Tunnel deleted", tunnel: deleted });
 });
@@ -522,84 +548,31 @@ app.post("/api/traffic/simulate", async (req, res) => {
   probeReq.end();
 });
 
-// Control Plane Ingress Notice: Edge Data Plane is handled by Go Gateway
-app.all(["/tunnel/:subdomain", "/tunnel/:subdomain/*"], (req, res) => {
-  const { subdomain } = req.params;
-  res.status(400).json({
-    status: "control_plane_boundary",
-    error: "Direct edge HTTP/TCP traffic is handled exclusively by the Go Edge Gateway (gateway/main.go on ports 80/443 -> TCP 4242 wire to agent).",
-    architecture: {
-      dataPlane: "gateway/main.go (Go binary listening on :80, :443, :4242)",
-      controlPlane: "server.ts (Node.js REST/WebSocket Control Plane & Web UI on :3000)",
-      targetSubdomain: subdomain,
-      publicUrl: `https://${subdomain}.edgeproxy.mesh`,
-    },
-    action: `Run 'make run-gateway' to ingest real edge traffic, and 'make run-agent' to connect local ports over TCP.`,
-  });
-});
-
-// Interactive SQL Query Runner against Real Data
-app.post("/api/sql/query", (req, res) => {
+// Interactive SQL Query Runner against Real PostgreSQL Database
+app.post("/api/sql/query", async (req, res) => {
   const { query } = req.body;
   if (!query || typeof query !== "string") {
     return res.status(400).json({ error: "Query string is required" });
   }
 
-  const qLower = query.toLowerCase();
-
-  if (qLower.includes("tunnels")) {
-    const rows = tunnels.map((t) => ({
-      id: t.id,
-      subdomain: t.subdomain,
-      target_port: t.localPort,
-      protocol: t.protocol,
-      status: t.status,
-      tls_status: t.tlsStatus,
-      total_requests: t.totalRequests,
-      avg_latency_ms: t.avgLatency,
-    }));
-    return res.json({
-      columns: ["id", "subdomain", "target_port", "protocol", "status", "tls_status", "total_requests", "avg_latency_ms"],
-      rows,
-      rowCount: rows.length,
-      executionTimeMs: 0.18,
+  try {
+    const result = await executeQuery(query);
+    const columns = result.fields.map((f) => f.name);
+    res.json({
+      columns,
+      rows: result.rows,
+      rowCount: result.rowCount,
+      executionTimeMs: result.latencyMs,
+      source: result.source,
+      status: "SUCCESS",
+    });
+  } catch (err: any) {
+    res.status(400).json({
+      error: err.message,
+      query,
+      status: "ERROR",
     });
   }
-
-  if (qLower.includes("traffic_logs") || qLower.includes("rps")) {
-    const rows = logs.slice(0, 50).map((l) => ({
-      id: l.id,
-      timestamp: l.timestamp,
-      subdomain: l.subdomain,
-      method: l.method,
-      path: l.path,
-      status_code: l.statusCode,
-      latency_ms: l.latencyMs,
-      blocked_by_shield: l.blockedByShield,
-    }));
-    return res.json({
-      columns: ["id", "timestamp", "subdomain", "method", "path", "status_code", "latency_ms", "blocked_by_shield"],
-      rows,
-      rowCount: rows.length,
-      executionTimeMs: 0.22,
-    });
-  }
-
-  if (qLower.includes("users")) {
-    return res.json({
-      columns: ["id", "email", "plan_tier", "max_tunnels", "max_rps", "created_at"],
-      rows: [],
-      rowCount: 0,
-      executionTimeMs: 0.12,
-    });
-  }
-
-  res.json({
-    columns: ["status", "message"],
-    rows: [{ status: "OK", message: "Query parsed successfully against PostgreSQL 16 schema." }],
-    rowCount: 1,
-    executionTimeMs: 0.15,
-  });
 });
 
 // Server-side AI Traffic & Threat Diagnosis
@@ -669,6 +642,32 @@ app.all("/api/*", (req, res) => {
 
 // Vite Middleware & SPA Static Fallback
 async function start() {
+  // Initialize Database connection (PostgreSQL / Relational Engine)
+  await initDb();
+  const dbTunnels = await dbGetTunnels();
+  if (dbTunnels && dbTunnels.length > 0) {
+    dbTunnels.forEach((t) => {
+      if (!tunnels.some((existing) => existing.subdomain === t.subdomain)) {
+        tunnels.push({
+          id: t.id,
+          name: `Tunnel ${t.subdomain}`,
+          subdomain: t.subdomain,
+          localPort: t.target_port || 3000,
+          protocol: t.protocol || "quic",
+          status: t.is_active ? "online" : "offline",
+          tlsStatus: t.tls_status || "active",
+          authEnabled: Boolean(t.auth_enabled),
+          authUser: t.auth_user || undefined,
+          totalRequests: 0,
+          bytesTransferred: 0,
+          avgLatency: 0,
+          publicUrl: `https://${t.subdomain}.edgeproxy.mesh`,
+          createdAt: t.created_at || new Date().toISOString(),
+        });
+      }
+    });
+  }
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },

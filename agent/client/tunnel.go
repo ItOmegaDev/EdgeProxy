@@ -21,6 +21,7 @@ const (
 	FrameFin  byte = 0x03
 	FramePing byte = 0x04
 	FramePong byte = 0x05
+	FrameAck  byte = 0x07
 )
 
 type TunnelClient struct {
@@ -84,15 +85,28 @@ func (c *TunnelClient) Start() error {
 		}
 
 		if frameType == FrameSyn || frameType == FrameData {
-			// Asynchronously forward to local port and stream back response
+			// Asynchronously forward to local port, chunk response and stream back
 			go func(sid uint32, raw []byte) {
 				respBytes, err := c.demuxer.ForwardRequest(raw)
 				if err != nil {
 					return
 				}
-				respFrame := encodeFrame(sid, FrameData, respBytes)
+
+				// Chunk response in 32KB pieces to prevent buffer saturation
+				const chunkSize = 32768
+				for offset := 0; offset < len(respBytes); offset += chunkSize {
+					end := offset + chunkSize
+					if end > len(respBytes) {
+						end = len(respBytes)
+					}
+					c.mu.Lock()
+					c.conn.Write(encodeFrame(sid, FrameData, respBytes[offset:end]))
+					c.mu.Unlock()
+				}
+
+				// Send FrameFin to signal end of stream to gateway
 				c.mu.Lock()
-				c.conn.Write(respFrame)
+				c.conn.Write(encodeFrame(sid, FrameFin, nil))
 				c.mu.Unlock()
 			}(streamID, payload)
 		}

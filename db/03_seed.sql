@@ -5,7 +5,7 @@
 
 INSERT INTO users (id, email, api_key, plan_tier, max_tunnels, max_rps)
 VALUES 
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'dev@edgeproxy.mesh', 'edg_live_demo_key', 'enterprise', 20, 500)
+    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'dev@edgeproxy.mesh', 'edg_sec_09a47f12e8b6c43d91', 'enterprise', 20, 500)
 ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO tunnels (id, user_id, subdomain, target_host, target_port, protocol, tls_status, is_active)
