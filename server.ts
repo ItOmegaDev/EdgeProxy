@@ -522,105 +522,20 @@ app.post("/api/traffic/simulate", async (req, res) => {
   probeReq.end();
 });
 
-// Real Reverse Proxy route: /tunnel/:subdomain/*
-app.all(["/tunnel/:subdomain", "/tunnel/:subdomain/*"], async (req, res) => {
+// Control Plane Ingress Notice: Edge Data Plane is handled by Go Gateway
+app.all(["/tunnel/:subdomain", "/tunnel/:subdomain/*"], (req, res) => {
   const { subdomain } = req.params;
-  const pathPart = req.url.replace(`/tunnel/${subdomain}`, "") || "/";
-  const targetTunnel = tunnels.find((t) => t.subdomain === subdomain);
-
-  if (!targetTunnel || targetTunnel.status !== "online") {
-    return res.status(404).json({ error: `Tunnel '${subdomain}' is offline or does not exist.` });
-  }
-
-  const startTime = Date.now();
-  const clientIp = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "127.0.0.1");
-  const limitCheck = checkRateLimit(clientIp);
-
-  if (!limitCheck.allowed) {
-    const latency = Date.now() - startTime;
-    recordRequest({
-      id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-      timestamp: new Date().toISOString(),
-      method: req.method,
-      path: pathPart,
-      statusCode: 429,
-      latencyMs: latency,
-      clientIp,
-      subdomain,
-      bytesIn: 64,
-      bytesOut: 64,
-      blockedByShield: true,
-    });
-    return res.status(429).json({ error: "429 Too Many Requests - Blocked by EdgeProxy Shield" });
-  }
-
-  const proxyReq = http.request(
-    {
-      hostname: "127.0.0.1",
-      port: targetTunnel.localPort,
-      path: pathPart,
-      method: req.method,
-      headers: {
-        ...req.headers,
-        host: `127.0.0.1:${targetTunnel.localPort}`,
-        "x-forwarded-for": clientIp,
-        "x-forwarded-proto": "https",
-        "x-edge-proxy": "EdgeProxy-Go/v1.0",
-      },
-      timeout: 5000,
+  res.status(400).json({
+    status: "control_plane_boundary",
+    error: "Direct edge HTTP/TCP traffic is handled exclusively by the Go Edge Gateway (gateway/main.go on ports 80/443 -> TCP 4242 wire to agent).",
+    architecture: {
+      dataPlane: "gateway/main.go (Go binary listening on :80, :443, :4242)",
+      controlPlane: "server.ts (Node.js REST/WebSocket Control Plane & Web UI on :3000)",
+      targetSubdomain: subdomain,
+      publicUrl: `https://${subdomain}.edgeproxy.mesh`,
     },
-    (proxyRes) => {
-      let bodyBytes = 0;
-      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-
-      proxyRes.on("data", (chunk) => {
-        bodyBytes += chunk.length;
-        res.write(chunk);
-      });
-
-      proxyRes.on("end", () => {
-        res.end();
-        const latency = Date.now() - startTime;
-        recordRequest({
-          id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-          timestamp: new Date().toISOString(),
-          method: req.method,
-          path: pathPart,
-          statusCode: proxyRes.statusCode || 200,
-          latencyMs: latency,
-          clientIp,
-          subdomain,
-          bytesIn: req.headers["content-length"] ? parseInt(req.headers["content-length"]) : 128,
-          bytesOut: bodyBytes,
-          blockedByShield: false,
-        });
-      });
-    }
-  );
-
-  proxyReq.on("error", () => {
-    const latency = Date.now() - startTime;
-    recordRequest({
-      id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-      timestamp: new Date().toISOString(),
-      method: req.method,
-      path: pathPart,
-      statusCode: 502,
-      latencyMs: latency,
-      clientIp,
-      subdomain,
-      bytesIn: 64,
-      bytesOut: 64,
-      blockedByShield: false,
-    });
-    res.status(502).json({ error: `Bad Gateway: Local target port ${targetTunnel.localPort} is not listening.` });
+    action: `Run 'make run-gateway' to ingest real edge traffic, and 'make run-agent' to connect local ports over TCP.`,
   });
-
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    req.pipe(proxyReq);
-  } else {
-    proxyReq.end();
-  }
 });
 
 // Interactive SQL Query Runner against Real Data
@@ -747,30 +662,12 @@ Provide a concise technical diagnostic:
   }
 });
 
-// Source Code Exporter for Go Core and SQL migrations
-app.get("/api/core/files", (req, res) => {
-  try {
-    const files: Record<string, string> = {
-      "gateway/main.go": fs.readFileSync(path.join(process.cwd(), "gateway/main.go"), "utf8"),
-      "gateway/proxy/router.go": fs.readFileSync(path.join(process.cwd(), "gateway/proxy/router.go"), "utf8"),
-      "gateway/protocol/framing.go": fs.readFileSync(path.join(process.cwd(), "gateway/protocol/framing.go"), "utf8"),
-      "gateway/limiter/bucket.go": fs.readFileSync(path.join(process.cwd(), "gateway/limiter/bucket.go"), "utf8"),
-      "agent/main.go": fs.readFileSync(path.join(process.cwd(), "agent/main.go"), "utf8"),
-      "agent/client/tunnel.go": fs.readFileSync(path.join(process.cwd(), "agent/client/tunnel.go"), "utf8"),
-      "agent/demux/demuxer.go": fs.readFileSync(path.join(process.cwd(), "agent/demux/demuxer.go"), "utf8"),
-      "db/01_schema.sql": fs.readFileSync(path.join(process.cwd(), "db/01_schema.sql"), "utf8"),
-      "db/02_indexes.sql": fs.readFileSync(path.join(process.cwd(), "db/02_indexes.sql"), "utf8"),
-      "db/03_seed.sql": fs.readFileSync(path.join(process.cwd(), "db/03_seed.sql"), "utf8"),
-    };
-    res.json(files);
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
+// Explicit 404 Catch-All for unknown API endpoints
+app.all("/api/*", (req, res) => {
+  res.status(404).json({ error: `API route not found: ${req.method} ${req.path}` });
 });
 
-// ==========================================
 // Vite Middleware & SPA Static Fallback
-// ==========================================
 async function start() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

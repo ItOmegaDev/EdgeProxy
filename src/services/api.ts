@@ -199,12 +199,6 @@ export const api = {
     return res.json();
   },
 
-  async getCoreFiles(): Promise<Record<string, string>> {
-    const res = await fetch('/api/core/files');
-    if (!res.ok) throw new Error('Failed to fetch Go and SQL core files');
-    return res.json();
-  },
-
   connectWebSocket(
     onMessage: (event: { type: string; data: any; timestamp: string }) => void,
     onStatusChange?: (connected: boolean) => void

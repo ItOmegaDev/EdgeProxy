@@ -14,7 +14,7 @@ import {
   ShieldCheck,
   RefreshCw
 } from 'lucide-react';
-import { api } from '../services/api';
+import { REFERENCE_CODE_ARCHIVE } from '../data/codeArchive';
 
 interface CoreCodeExplorerProps {
   language: 'ua' | 'en';
@@ -53,21 +53,15 @@ export const CoreCodeExplorer: React.FC<CoreCodeExplorerProps> = ({ language }) 
     },
   }[language];
 
+  const loadFiles = () => {
+    setLoading(true);
+    setFiles(REFERENCE_CODE_ARCHIVE);
+    setLoading(false);
+  };
+
   useEffect(() => {
     loadFiles();
   }, []);
-
-  const loadFiles = async () => {
-    setLoading(true);
-    try {
-      const data = await api.getCoreFiles();
-      setFiles(data);
-    } catch (err) {
-      console.warn('Could not load core files from backend, using fallback', err);
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const copyCode = () => {
     if (files[selectedFile]) {

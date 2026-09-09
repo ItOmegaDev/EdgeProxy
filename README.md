@@ -37,6 +37,45 @@ EdgeProxy follows a clean separation of concerns between high-throughput network
 
 ---
 
+## 🔀 Data Flow & Separation of Planes
+
+EdgeProxy strictly separates high-performance network data ingestion from configuration and telemetry management:
+
+```
+[Internet Users] 
+      │  (Public HTTP:80 / HTTPS:443)
+      ▼
+┌────────────────────────────────────────────────────────┐
+│  DATA PLANE: Go Edge Gateway (gateway/main.go)         │
+│  - Zero-copy TCP / TLS termination                     │
+│  - In-memory Host Header routing                       │
+│  - Token Bucket Rate Limiting & DDoS Shield            │
+│  - Binary Multiplexing Wire Protocol (TCP :4242)       │
+└──────────────────────────┬─────────────────────────────┘
+                           │ (Binary Framed Multiplexing: SYN/DATA/FIN)
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│  LOCAL AGENT: Go CLI Client (agent/main.go)            │
+│  - Authenticated tunnel session (-token <token>)       │
+│  - Demultiplexes frames to local ports (e.g. :3000)    │
+│  - Reverse-forwards traffic to local dev service       │
+└────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────┐
+│  CONTROL PLANE: Node.js / React (server.ts & src/)     │
+│  - Runs on port 3000 (isolated from edge data plane)   │
+│  - Exposes REST API & WebSockets for real-time graphs  │
+│  - Manages tunnel configs, certificates, & IP lists    │
+│  - NEVER proxies edge customer traffic in production   │
+└────────────────────────────────────────────────────────┘
+```
+
+- **Data Plane (Go Ingress)**: All incoming edge web traffic (`*.edgeproxy.mesh`) is terminated directly on the Go Edge Gateway (`gateway/main.go`) on port 80/443 and streamed over TCP port 4242 directly to the Go CLI agent via framed binary packets. Node.js never touches this high-throughput stream.
+- **Control Plane (Node.js/React)**: `server.ts` provides the operational API, telemetry aggregation, rate-limit policies, and web UI.
+- **Database Persistence**: Production state is backed by PostgreSQL schemas defined in `db/01_schema.sql` (partitioned traffic logs, B-tree/BRIN indexes in `db/02_indexes.sql`). For lightweight local prototyping, `server.ts` maintains an in-memory active cache that streams real-time updates over WebSocket.
+
+---
+
 ## ⚡ Quick Start
 
 ### 1. Build Binaries (Go & Web Dashboard)

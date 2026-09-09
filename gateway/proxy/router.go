@@ -108,9 +108,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Allocate a new stream ID
+	// Allocate a new stream ID with buffered response channel to prevent HOL blocking
 	streamID := atomic.AddUint32(&session.NextStream, 1)
-	respChan := make(chan []byte, 16)
+	respChan := make(chan []byte, 128)
 
 	session.StreamsMu.Lock()
 	session.Streams[streamID] = respChan

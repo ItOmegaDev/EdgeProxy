@@ -106,7 +106,24 @@ func handleAgentConnection(router *proxy.Router, conn net.Conn) {
 		session.StreamsMu.RUnlock()
 
 		if exists && ch != nil {
-			ch <- f.Payload
+			if f.Type == protocol.FrameFin {
+				// Handle stream termination from agent
+				session.StreamsMu.Lock()
+				delete(session.Streams, f.StreamID)
+				session.StreamsMu.Unlock()
+				select {
+				case ch <- f.Payload:
+				default:
+				}
+				close(ch)
+			} else {
+				// Non-blocking write with backpressure timeout to prevent HOL blocking
+				select {
+				case ch <- f.Payload:
+				case <-time.After(300 * time.Millisecond):
+					log.Printf("[AGENT-BACKPRESSURE] Stream %d channel saturated, frame dropped to prevent head-of-line blocking", f.StreamID)
+				}
+			}
 		}
 	}
 }
