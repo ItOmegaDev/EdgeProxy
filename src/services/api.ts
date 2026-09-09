@@ -36,6 +36,7 @@ export interface SqlResult {
   rows: any[];
   rowCount: number;
   executionTimeMs: number;
+  source?: string;
   error?: string;
 }
 
@@ -183,6 +184,34 @@ export const api = {
       const err = await res.json();
       throw new Error(err.error || 'SQL execution failed');
     }
+    return res.json();
+  },
+
+  async getDatabaseStatus(): Promise<any> {
+    const res = await fetch('/api/database/status');
+    if (!res.ok) throw new Error('Failed to fetch database status');
+    return res.json();
+  },
+
+  async getUsers(): Promise<any[]> {
+    const res = await fetch('/api/users');
+    if (!res.ok) throw new Error('Failed to fetch users');
+    return res.json();
+  },
+
+  async getFirestoreCollection(name: string, limit: number = 50): Promise<{ collection: string; count: number; docs: any[] }> {
+    const res = await fetch(`/api/database/collections/${name}?limit=${limit}`);
+    if (!res.ok) throw new Error(`Failed to fetch collection ${name}`);
+    return res.json();
+  },
+
+  async insertFirestoreDoc(name: string, data: any): Promise<any> {
+    const res = await fetch(`/api/database/collections/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) throw new Error(`Failed to insert document into ${name}`);
     return res.json();
   },
 

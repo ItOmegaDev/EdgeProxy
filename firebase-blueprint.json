@@ -1,0 +1,91 @@
+{
+  "entities": {
+    "Tunnel": {
+      "title": "Tunnel",
+      "description": "Registered edge tunnel configuration and forwarding target",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique tunnel ID" },
+        "subdomain": { "type": "string", "description": "Routing subdomain" },
+        "target_port": { "type": "number", "description": "Target local port" },
+        "protocol": { "type": "string", "enum": ["quic", "http2", "websocket", "tcp"] },
+        "tls_status": { "type": "string", "enum": ["active", "renewing", "failed"] },
+        "auth_enabled": { "type": "boolean" },
+        "auth_user": { "type": "string" },
+        "is_active": { "type": "boolean" },
+        "total_requests": { "type": "number" },
+        "bytes_transferred": { "type": "number" },
+        "avg_latency": { "type": "number" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "last_ping_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "subdomain", "target_port", "protocol", "is_active"]
+    },
+    "TrafficLog": {
+      "title": "TrafficLog",
+      "description": "Telemetry request log record captured by EdgeProxy gateway",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Log record ID" },
+        "tunnel_id": { "type": "string" },
+        "subdomain": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "method": { "type": "string" },
+        "path": { "type": "string" },
+        "status_code": { "type": "number" },
+        "latency_ms": { "type": "number" },
+        "bytes_in": { "type": "number" },
+        "bytes_out": { "type": "number" },
+        "client_ip": { "type": "string" },
+        "blocked_by_shield": { "type": "boolean" }
+      },
+      "required": ["id", "subdomain", "method", "path", "status_code", "latency_ms", "timestamp"]
+    },
+    "User": {
+      "title": "User",
+      "description": "User account and API credential identity",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "User UUID" },
+        "email": { "type": "string", "format": "email" },
+        "api_key": { "type": "string" },
+        "plan_tier": { "type": "string", "enum": ["starter", "pro", "enterprise"] },
+        "max_tunnels": { "type": "number" },
+        "max_rps": { "type": "number" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "email", "api_key", "plan_tier"]
+    },
+    "RateLimitRule": {
+      "title": "RateLimitRule",
+      "description": "Dynamic DDoS shield and token bucket configuration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "capacity": { "type": "number" },
+        "refill_rate": { "type": "number" },
+        "whitelisted_ips": { "type": "array" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "capacity", "refill_rate"]
+    }
+  },
+  "firestore": {
+    "/tunnels/{tunnelId}": {
+      "schema": "Tunnel",
+      "description": "Active and configured EdgeProxy network tunnels"
+    },
+    "/traffic_logs/{logId}": {
+      "schema": "TrafficLog",
+      "description": "Live traffic telemetry and audit logs"
+    },
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User identity and authentication credentials"
+    },
+    "/rate_limit_rules/{ruleId}": {
+      "schema": "RateLimitRule",
+      "description": "DDoS and rate limiting bucket rules"
+    }
+  }
+}

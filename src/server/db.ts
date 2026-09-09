@@ -31,6 +31,18 @@ let activeDatabaseId = '(default)';
 
 // Load Firebase Config
 function loadFirebaseConfig() {
+  if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_API_KEY) {
+    return {
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      apiKey: process.env.FIREBASE_API_KEY,
+      authDomain: process.env.FIREBASE_AUTH_DOMAIN || `${process.env.FIREBASE_PROJECT_ID}.firebaseapp.com`,
+      firestoreDatabaseId: process.env.FIREBASE_DATABASE_ID || '(default)',
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || `${process.env.FIREBASE_PROJECT_ID}.firebasestorage.app`,
+      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
+      appId: process.env.FIREBASE_APP_ID || '',
+    };
+  }
+
   try {
     const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
     if (fs.existsSync(configPath)) {
@@ -215,6 +227,47 @@ export async function dbGetTrafficLogs(limitCount: number = 50): Promise<any[]> 
     }
   }
   return [];
+}
+
+export async function dbGetUsers(): Promise<any[]> {
+  if (isFirestoreReady && firestoreDb) {
+    try {
+      const usersCol = collection(firestoreDb, 'users');
+      const snap = await getDocs(usersCol);
+      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    } catch (err: any) {
+      console.warn('[Firebase Firestore] Failed fetching users:', err.message);
+    }
+  }
+  return [];
+}
+
+export async function dbGetCollectionDocs(collectionName: string, limitCount: number = 50): Promise<any[]> {
+  if (isFirestoreReady && firestoreDb) {
+    try {
+      const colRef = collection(firestoreDb, collectionName);
+      const q = query(colRef, fsLimit(limitCount));
+      const snap = await getDocs(q);
+      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    } catch (err: any) {
+      console.warn(`[Firebase Firestore] Failed fetching collection ${collectionName}:`, err.message);
+    }
+  }
+  return [];
+}
+
+export async function dbInsertSampleDoc(collectionName: string, data: any): Promise<any> {
+  if (isFirestoreReady && firestoreDb) {
+    try {
+      const docId = data.id || `${collectionName.slice(0, 3)}-${Date.now()}`;
+      const record = { ...data, id: docId, updated_at: new Date().toISOString() };
+      await setDoc(doc(firestoreDb, collectionName, docId), record);
+      return record;
+    } catch (err: any) {
+      console.warn(`[Firebase Firestore] Failed inserting to ${collectionName}:`, err.message);
+    }
+  }
+  return null;
 }
 
 // SQL Query Execution Engine running directly against Firebase Collections

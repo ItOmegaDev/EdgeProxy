@@ -15,6 +15,9 @@ import {
   dbInsertTunnel,
   dbDeleteTunnel,
   dbInsertTrafficLog,
+  dbGetUsers,
+  dbGetCollectionDocs,
+  dbInsertSampleDoc,
   dbGetStatus,
 } from "./src/server/db";
 
@@ -603,6 +606,42 @@ app.post("/api/sql/query", async (req, res) => {
       query,
       status: "ERROR",
     });
+  }
+});
+
+// Database & Firebase Firestore Direct Management API
+app.get("/api/database/status", (req, res) => {
+  res.json(dbGetStatus());
+});
+
+app.get("/api/users", async (req, res) => {
+  try {
+    const userList = await dbGetUsers();
+    res.json(userList);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/database/collections/:name", async (req, res) => {
+  try {
+    const { name } = req.params;
+    const limit = Number(req.query.limit) || 50;
+    const docs = await dbGetCollectionDocs(name, limit);
+    res.json({ collection: name, count: docs.length, docs });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/database/collections/:name", async (req, res) => {
+  try {
+    const { name } = req.params;
+    const docData = req.body;
+    const created = await dbInsertSampleDoc(name, docData);
+    res.json({ success: true, collection: name, doc: created });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
 });
 
