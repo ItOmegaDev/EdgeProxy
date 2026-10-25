@@ -85,7 +85,7 @@ edge_gateway:
   port: 443
   tls: true
   protocol: "${cliProtocol}"
-  auth_token: "mesh_sec_9941a87b4012f"
+  auth_token: "demo-auth-token"
   keepalive_interval: 15s
 
 auto_discovery:

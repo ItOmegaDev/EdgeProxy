@@ -81,7 +81,7 @@ export async function initDb(): Promise<boolean> {
       await setDoc(doc(firestoreDb, 'users', '00000000-0000-0000-0000-000000000001'), {
         id: '00000000-0000-0000-0000-000000000001',
         email: 'admin@edgeproxy.mesh',
-        api_key: 'edg_sec_09a47f12e8b6c43d91',
+        api_key: 'demo-api-key',
         plan_tier: 'enterprise',
         max_tunnels: 50,
         max_rps: 1000,
