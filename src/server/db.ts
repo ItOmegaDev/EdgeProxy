@@ -78,16 +78,23 @@ export async function initDb(): Promise<boolean> {
     const usersCol = collection(firestoreDb, 'users');
     const userSnap = await getDocs(query(usersCol, fsLimit(1)));
     if (userSnap.empty) {
-      await setDoc(doc(firestoreDb, 'users', '00000000-0000-0000-0000-000000000001'), {
-        id: '00000000-0000-0000-0000-000000000001',
-        email: 'admin@edgeproxy.mesh',
-        api_key: 'demo-api-key',
-        plan_tier: 'enterprise',
-        max_tunnels: 50,
-        max_rps: 1000,
-        created_at: new Date().toISOString()
-      });
-      console.log('[Firebase Firestore] Seeded initial admin account in users collection.');
+      // Ключ НЕ вбудовується в код: без явно заданого SEED_ADMIN_API_KEY
+      // сід не створюється (deny by default, N7).
+      const seedAdminKey = process.env.SEED_ADMIN_API_KEY?.trim();
+      if (!seedAdminKey) {
+        console.warn('[Firebase] users порожня, SEED_ADMIN_API_KEY не заданий — сід адміна пропущено.');
+      } else {
+        await setDoc(doc(firestoreDb, 'users', '00000000-0000-0000-0000-000000000001'), {
+          id: '00000000-0000-0000-0000-000000000001',
+          email: process.env.SEED_ADMIN_EMAIL?.trim() || 'admin@localhost',
+          api_key: seedAdminKey,
+          plan_tier: 'enterprise',
+          max_tunnels: 50,
+          max_rps: 1000,
+          created_at: new Date().toISOString()
+        });
+        console.log('[Firebase Firestore] Seeded initial admin account in users collection.');
+      }
     }
 
     const tunnelsCol = collection(firestoreDb, 'tunnels');
