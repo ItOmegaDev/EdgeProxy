@@ -76,6 +76,11 @@ const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", false);
 app.use(express.json({ limit: "1mb", strict: true }));
+app.use((req, _res, next) => {
+  // JSON bodies are optional; normalize missing bodies so handlers can destructure.
+  if (req.body === undefined) req.body = {};
+  next();
+});
 
 // Lazy-initialized Gemini AI Client
 let aiClient: GoogleGenAI | null = null;
