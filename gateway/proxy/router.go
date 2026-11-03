@@ -3,6 +3,9 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,10 +23,10 @@ import (
 
 // AllowedTunnelConfig holds tunnel permissions synchronized from Control Plane / Database
 type AllowedTunnelConfig struct {
-	Subdomain string  `json:"subdomain"`
-	AuthToken string  `json:"token"`
-	MaxRPS    float64 `json:"maxRps"`
-	IsActive  bool    `json:"isActive"`
+	Subdomain     string  `json:"subdomain"`
+	AuthTokenHash string  `json:"tokenHash"`
+	MaxRPS        float64 `json:"maxRps"`
+	IsActive      bool    `json:"isActive"`
 }
 
 // AgentTelemetry represents metrics reported by the agent's local metrics collector
@@ -61,7 +64,7 @@ type TunnelSession struct {
 // Router maintains active subdomain mappings and proxies incoming TCP/HTTP requests
 type Router struct {
 	mu             sync.RWMutex
-	sessions       map[string]*TunnelSession       // key: subdomain
+	sessions       map[string]*TunnelSession      // key: subdomain
 	allowedTunnels map[string]AllowedTunnelConfig // synchronized from Control Plane / DB
 	rateLimiter    *limiter.RateLimiterStore
 	baseDomain     string
@@ -76,40 +79,80 @@ func NewRouter(baseDomain string, rps, burst float64) *Router {
 	}
 }
 
-// SyncAllowedTunnels loads or updates allowed tunnels from DB / Control Plane
+// SyncAllowedTunnels loads or updates allowed tunnels from DB / Control Plane.
+// Invalid entries are ignored instead of widening access.
 func (r *Router) SyncAllowedTunnels(configs []AllowedTunnelConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	newMap := make(map[string]AllowedTunnelConfig)
+	skipped := 0
 	for _, cfg := range configs {
+		if !ValidSubdomain(cfg.Subdomain) || !validTokenHash(cfg.AuthTokenHash) {
+			skipped++
+			continue
+		}
 		newMap[cfg.Subdomain] = cfg
 	}
 	r.allowedTunnels = newMap
-	log.Printf("[ROUTER-SYNC] Synchronized %d authorized tunnels from Control Plane database", len(newMap))
+	log.Printf("[ROUTER-SYNC] Synchronized %d authorized tunnels (skipped %d invalid)", len(newMap), skipped)
 }
 
-// VerifyAuthorization verifies if agent's token is allowed according to DB state
-func (r *Router) VerifyAuthorization(subdomain, token string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	// If no tunnels configured yet in DB, allow initial bootstrap tokens
-	if len(r.allowedTunnels) == 0 {
-		return token != ""
-	}
-
-	cfg, exists := r.allowedTunnels[subdomain]
-	if !exists {
+// ValidSubdomain reports whether value is a single, safe DNS label.
+func ValidSubdomain(value string) bool {
+	if len(value) < 1 || len(value) > 63 {
 		return false
 	}
-	return cfg.IsActive && (cfg.AuthToken == "" || cfg.AuthToken == token)
+	if value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validTokenHash(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+// VerifyAuthorization checks the agent token against the stored SHA-256 hash.
+// Deny by default: no configured tunnels, inactive tunnels, empty hashes and
+// empty tokens are all rejected.
+func (r *Router) VerifyAuthorization(subdomain, token string) bool {
+	if !ValidSubdomain(subdomain) || token == "" || len(token) > 512 {
+		return false
+	}
+
+	r.mu.RLock()
+	cfg, exists := r.allowedTunnels[subdomain]
+	r.mu.RUnlock()
+
+	if !exists || !cfg.IsActive || !validTokenHash(cfg.AuthTokenHash) {
+		return false
+	}
+
+	sum := sha256.Sum256([]byte(token))
+	presented := hex.EncodeToString(sum[:])
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(strings.ToLower(cfg.AuthTokenHash))) == 1
 }
 
 // RegisterSession attaches a new authenticated local agent tunnel
 func (r *Router) RegisterSession(subdomain string, conn net.Conn) *TunnelSession {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// If a previous session exists for this subdomain, close it before replacing.
+	if previous, exists := r.sessions[subdomain]; exists && previous != nil {
+		_ = previous.Conn.Close()
+	}
 
 	session := &TunnelSession{
 		ID:        fmt.Sprintf("sess_%d", time.Now().UnixNano()),
@@ -181,26 +224,49 @@ func (r *Router) GetActiveSessionsSnapshot() []map[string]interface{} {
 
 // ServeHTTP inspects Host header and proxies request through the binary tunnel
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Liveness endpoint used by container orchestration. It exposes no state.
+	if req.URL.Path == "/healthz" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+		return
+	}
+
 	clientIP, _, _ := net.SplitHostPort(req.RemoteAddr)
 	if !r.rateLimiter.Check(clientIP) {
 		http.Error(w, "HTTP 429: Rate Limit Exceeded (DDoS Shield Activated)", http.StatusTooManyRequests)
 		return
 	}
 
-	host := req.Host
-	if colonIdx := strings.Index(host, ":"); colonIdx != -1 {
-		host = host[:colonIdx]
+	host := strings.ToLower(req.Host)
+	if hostOnly, _, err := net.SplitHostPort(host); err == nil {
+		host = hostOnly
+	}
+	baseDomain := strings.ToLower(r.baseDomain)
+
+	subdomain := ""
+	if host == baseDomain {
+		subdomain = ""
+	} else if strings.HasSuffix(host, "."+baseDomain) {
+		subdomain = strings.TrimSuffix(host, "."+baseDomain)
+	} else {
+		http.Error(w, "HTTP 404: Unknown host", http.StatusNotFound)
+		return
 	}
 
-	subdomain := strings.TrimSuffix(host, "."+r.baseDomain)
-	if subdomain == host {
+	if subdomain == "" {
 		// Root domain hit
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		r.mu.RLock()
 		activeCount := len(r.sessions)
 		r.mu.RUnlock()
-		fmt.Fprintf(w, `{"service":"EdgeProxy Gateway","status":"online","tunnels_active":%d,"base_domain":"%s"}`, activeCount, r.baseDomain)
+		fmt.Fprintf(w, `{"service":"EdgeProxy Gateway","status":"online","tunnels_active":%d,"base_domain":"%s"}`, activeCount, baseDomain)
+		return
+	}
+
+	if !ValidSubdomain(subdomain) {
+		http.Error(w, "HTTP 400: Invalid subdomain", http.StatusBadRequest)
 		return
 	}
 
@@ -209,7 +275,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.mu.RUnlock()
 
 	if !exists {
-		http.Error(w, fmt.Sprintf("HTTP 502: Tunnel '%s.%s' is currently offline or unreachable", subdomain, r.baseDomain), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("HTTP 502: Tunnel '%s.%s' is currently offline or unreachable", subdomain, baseDomain), http.StatusBadGateway)
 		return
 	}
 

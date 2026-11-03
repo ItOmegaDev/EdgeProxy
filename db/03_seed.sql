@@ -3,9 +3,12 @@
 -- File: 03_seed.sql
 -- ==========================================================
 
-INSERT INTO users (id, email, api_key, plan_tier, max_tunnels, max_rps)
+-- Development-only seed data. Replace the placeholder hash before use and never
+-- commit a real API key. Generate a hash with:
+--   printf '%s' "$EDGEPROXY_API_KEY" | sha256sum
+INSERT INTO users (id, email, api_key_hash, plan_tier, max_tunnels, max_rps)
 VALUES 
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'dev@edgeproxy.mesh', 'edg_sec_09a47f12e8b6c43d91', 'enterprise', 20, 500)
+    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'dev@edgeproxy.mesh', 'REPLACE_WITH_SHA256_HEX_OF_API_KEY', 'enterprise', 20, 500)
 ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO tunnels (id, user_id, subdomain, target_host, target_port, protocol, tls_status, is_active)

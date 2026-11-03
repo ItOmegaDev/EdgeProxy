@@ -1,20 +1,16 @@
 rules_version = '2';
+
+// EdgeProxy stores its data through the Firebase Admin SDK (server-side), which
+// bypasses these rules. Browser and mobile clients must never talk to Firestore
+// directly, so the default is a hard deny for every collection.
+//
+// If a future client needs direct access, add a narrowly scoped rule with
+// request.auth, ownership checks and schema validation. Never use
+// `allow read, write: if true`.
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /tunnels/{tunnelId} {
-      allow read, write: if true;
-    }
-    match /users/{userId} {
-      allow read, write: if true;
-    }
-    match /traffic_logs/{logId} {
-      allow read, write: if true;
-    }
-    match /rate_limit_rules/{ruleId} {
-      allow read, write: if true;
-    }
-    match /certificates/{certId} {
-      allow read, write: if true;
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -35,6 +36,7 @@ type TunnelClient struct {
 	subdomain   string
 	localPort   int
 	token       string
+	domain      string
 	demuxer     *demux.StreamDemuxer
 	collector   *metrics.LocalMetricsCollector
 	conn        net.Conn
@@ -46,13 +48,14 @@ type TunnelClient struct {
 	ackChansMu sync.RWMutex
 }
 
-func NewTunnelClient(gatewayAddr, subdomain string, localPort int, token string) *TunnelClient {
+func NewTunnelClient(gatewayAddr, subdomain, domain string, localPort int, token string) *TunnelClient {
 	agentID := fmt.Sprintf("agent-%s-%d", subdomain, time.Now().Unix())
 	return &TunnelClient{
 		gatewayAddr: gatewayAddr,
 		subdomain:   subdomain,
 		localPort:   localPort,
 		token:       token,
+		domain:      domain,
 		demuxer:     demux.NewStreamDemuxer(fmt.Sprintf("127.0.0.1:%d", localPort)),
 		collector:   metrics.NewMetricsCollector(agentID, subdomain),
 		ackChans:    make(map[uint32]chan struct{}),
@@ -71,13 +74,36 @@ func (c *TunnelClient) Start() error {
 	c.running = true
 
 	// Handshake: send SYN frame with JSON handshake payload containing subdomain + auth token
-	handshakePayload := fmt.Sprintf(`{"subdomain":"%s","token":"%s","version":"v1.0.0-PROD"}`, c.subdomain, c.token)
-	handshakeFrame := encodeFrame(0, FrameSyn, []byte(handshakePayload))
+	handshakePayload, err := json.Marshal(map[string]string{
+		"subdomain": c.subdomain,
+		"token":     c.token,
+		"version":   "v1.0.0",
+	})
+	if err != nil {
+		return fmt.Errorf("failed encoding handshake: %w", err)
+	}
+	handshakeFrame := encodeFrame(0, FrameSyn, handshakePayload)
 	if _, err := c.conn.Write(handshakeFrame); err != nil {
 		return fmt.Errorf("handshake write failed: %w", err)
 	}
 
-	log.Printf("[AGENT] Tunnel online! Public URL: https://%s.edgeproxy.mesh -> http://127.0.0.1:%d", c.subdomain, c.localPort)
+	// Wait for the gateway's handshake acknowledgement. A rejected token comes
+	// back as FrameRst with an explanatory payload.
+	_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, replyType, replyPayload, err := readFrame(c.conn)
+	if err != nil {
+		return fmt.Errorf("handshake acknowledgement failed: %w", err)
+	}
+	_ = c.conn.SetReadDeadline(time.Time{})
+
+	if replyType == FrameRst {
+		return fmt.Errorf("gateway rejected tunnel: %s", string(replyPayload))
+	}
+	if replyType != FrameAck {
+		return fmt.Errorf("unexpected handshake reply type 0x%02x", replyType)
+	}
+
+	log.Printf("[AGENT] Tunnel online! Public URL: https://%s.%s -> http://127.0.0.1:%d", c.subdomain, c.domain, c.localPort)
 
 	// Keep-alive heartbeat loop
 	go c.heartbeatLoop()
@@ -240,6 +266,11 @@ func readFrame(r io.Reader) (uint32, byte, []byte, error) {
 	streamID := binary.BigEndian.Uint32(header[0:4])
 	frameType := header[4]
 	length := binary.BigEndian.Uint32(header[5:9])
+
+	// Mirror the gateway limit: reject oversized frames before allocating.
+	if length > 65536 {
+		return 0, 0, nil, fmt.Errorf("frame payload %d exceeds 64KB limit", length)
+	}
 
 	payload := make([]byte, length)
 	if length > 0 {

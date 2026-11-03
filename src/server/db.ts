@@ -1,362 +1,328 @@
-import fs from 'fs';
-import path from 'path';
-import { initializeApp, getApps, getApp } from 'firebase/app';
+import fs from "fs";
+import crypto from "crypto";
 import {
-  getFirestore,
-  collection,
-  doc,
-  getDocs,
-  getDoc,
-  setDoc,
-  deleteDoc,
-  query,
-  orderBy,
-  limit as fsLimit,
-  addDoc,
-  Firestore,
-} from 'firebase/firestore';
+  applicationDefault,
+  cert,
+  getApps,
+  initializeApp,
+  type App,
+  type Credential,
+} from "firebase-admin/app";
+import { getFirestore, type Firestore } from "firebase-admin/firestore";
+import { hashToken, isAllowedCollection, redactSecrets } from "./security";
 
 export interface SqlQueryResult {
   rows: any[];
   rowCount: number;
   fields: { name: string; dataType?: string }[];
   latencyMs: number;
-  source: 'firebase-firestore' | 'embedded-engine';
+  source: "firebase-firestore" | "embedded-engine";
 }
 
+let firebaseApp: App | null = null;
 let firestoreDb: Firestore | null = null;
 let isFirestoreReady = false;
-let activeProjectId = '';
-let activeDatabaseId = '(default)';
+let activeProjectId = "";
+let activeDatabaseId = "(default)";
+let lastInitError = "";
 
-// Load Firebase Config
-function loadFirebaseConfig() {
-  if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_API_KEY) {
-    return {
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      apiKey: process.env.FIREBASE_API_KEY,
-      authDomain: process.env.FIREBASE_AUTH_DOMAIN || `${process.env.FIREBASE_PROJECT_ID}.firebaseapp.com`,
-      firestoreDatabaseId: process.env.FIREBASE_DATABASE_ID || '(default)',
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || `${process.env.FIREBASE_PROJECT_ID}.firebasestorage.app`,
-      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
-      appId: process.env.FIREBASE_APP_ID || '',
-    };
+/**
+ * Loads a Firebase Admin credential from, in order:
+ *   1. FIREBASE_SERVICE_ACCOUNT_JSON (raw JSON or base64-encoded JSON)
+ *   2. GOOGLE_APPLICATION_CREDENTIALS (path to a service-account JSON file)
+ *   3. Application Default Credentials, but only when FIREBASE_PROJECT_ID is set
+ *
+ * The browser Firebase config is intentionally not used: the control plane needs
+ * admin privileges, and Firestore rules deny all direct client access.
+ */
+function loadCredential(): Credential | null {
+  const inline = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+  if (inline) {
+    const raw = inline.startsWith("{") ? inline : Buffer.from(inline, "base64").toString("utf8");
+    return cert(JSON.parse(raw));
   }
 
-  try {
-    const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
-    if (fs.existsSync(configPath)) {
-      const raw = fs.readFileSync(configPath, 'utf8');
-      return JSON.parse(raw);
+  const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+  if (credentialsPath) {
+    const stat = fs.statSync(credentialsPath);
+    if (!stat.isFile()) {
+      throw new Error("GOOGLE_APPLICATION_CREDENTIALS does not point to a file");
     }
-  } catch (err: any) {
-    console.warn('[Firebase] Warning reading firebase-applet-config.json:', err.message);
+    return cert(JSON.parse(fs.readFileSync(credentialsPath, "utf8")));
   }
+
+  if (process.env.FIREBASE_PROJECT_ID?.trim()) {
+    return applicationDefault();
+  }
+
   return null;
 }
 
 export async function initDb(): Promise<boolean> {
   try {
-    const config = loadFirebaseConfig();
-    if (!config || !config.projectId) {
-      console.warn('[Firebase] No valid firebase-applet-config.json found.');
+    const credential = loadCredential();
+    if (!credential) {
+      lastInitError = "No Firebase Admin credentials configured";
+      console.warn(
+        "[Firebase] Admin credentials not configured. Running with in-memory state only.",
+      );
       return false;
     }
 
-    activeProjectId = config.projectId;
-    activeDatabaseId = config.firestoreDatabaseId || '(default)';
+    const projectId = process.env.FIREBASE_PROJECT_ID?.trim() || undefined;
+    const databaseId = process.env.FIREBASE_DATABASE_ID?.trim() || "(default)";
 
-    const app = getApps().length === 0 ? initializeApp(config) : getApp();
+    firebaseApp =
+      getApps().length > 0
+        ? getApps()[0]
+        : initializeApp({
+            credential,
+            projectId,
+          });
 
-    if (config.firestoreDatabaseId && config.firestoreDatabaseId !== '(default)') {
-      firestoreDb = getFirestore(app, config.firestoreDatabaseId);
-    } else {
-      firestoreDb = getFirestore(app);
-    }
+    firestoreDb =
+      databaseId !== "(default)" ? getFirestore(firebaseApp, databaseId) : getFirestore(firebaseApp);
 
-    // Ping Firestore by checking or seeding initial admin user and default tunnels
-    const usersCol = collection(firestoreDb, 'users');
-    const userSnap = await getDocs(query(usersCol, fsLimit(1)));
-    if (userSnap.empty) {
-      // Ключ НЕ вбудовується в код: без явно заданого SEED_ADMIN_API_KEY
-      // сід не створюється (deny by default, N7).
-      const seedAdminKey = process.env.SEED_ADMIN_API_KEY?.trim();
-      if (!seedAdminKey) {
-        console.warn('[Firebase] users порожня, SEED_ADMIN_API_KEY не заданий — сід адміна пропущено.');
-      } else {
-        await setDoc(doc(firestoreDb, 'users', '00000000-0000-0000-0000-000000000001'), {
-          id: '00000000-0000-0000-0000-000000000001',
-          email: process.env.SEED_ADMIN_EMAIL?.trim() || 'admin@localhost',
-          api_key: seedAdminKey,
-          plan_tier: 'enterprise',
+    activeProjectId = projectId || firebaseApp.options.projectId || "(unknown)";
+    activeDatabaseId = databaseId;
+
+    // Ping the database so misconfiguration is detected at startup.
+    await firestoreDb.collection("tunnels").limit(1).get();
+
+    // Optional admin seed. Never runs without an explicit key, and only the
+    // hash of that key is stored.
+    const seedAdminKey = process.env.SEED_ADMIN_API_KEY?.trim();
+    if (seedAdminKey) {
+      const usersCol = firestoreDb.collection("users");
+      const existing = await usersCol.limit(1).get();
+      if (existing.empty) {
+        await usersCol.doc("00000000-0000-0000-0000-000000000001").set({
+          id: "00000000-0000-0000-0000-000000000001",
+          email: process.env.SEED_ADMIN_EMAIL?.trim() || "admin@localhost",
+          api_key_hash: hashToken(seedAdminKey),
+          api_key_last4: seedAdminKey.slice(-4),
+          plan_tier: "enterprise",
           max_tunnels: 50,
           max_rps: 1000,
-          created_at: new Date().toISOString()
+          created_at: new Date().toISOString(),
         });
-        console.log('[Firebase Firestore] Seeded initial admin account in users collection.');
+        console.log("[Firebase] Seeded the initial admin account (hash only).");
       }
     }
 
-    const tunnelsCol = collection(firestoreDb, 'tunnels');
-    const tunnelSnap = await getDocs(query(tunnelsCol, fsLimit(1)));
-    if (tunnelSnap.empty) {
-      await setDoc(doc(firestoreDb, 'tunnels', 'tun-prod-cloud'), {
-        id: 'tun-prod-cloud',
-        subdomain: 'cloud',
-        target_port: 8080,
-        protocol: 'quic',
-        tls_status: 'active',
-        auth_enabled: false,
-        is_active: true,
-        total_requests: 0,
-        bytes_transferred: 0,
-        avg_latency: 0,
-        created_at: new Date().toISOString(),
-        last_ping_at: new Date().toISOString()
-      });
-      await setDoc(doc(firestoreDb, 'tunnels', 'tun-prod-api'), {
-        id: 'tun-prod-api',
-        subdomain: 'api',
-        target_port: 3000,
-        protocol: 'http2',
-        tls_status: 'active',
-        auth_enabled: true,
-        auth_user: 'admin',
-        is_active: true,
-        total_requests: 0,
-        bytes_transferred: 0,
-        avg_latency: 0,
-        created_at: new Date().toISOString(),
-        last_ping_at: new Date().toISOString()
-      });
-      console.log('[Firebase Firestore] Seeded default production tunnels.');
-    }
-
     isFirestoreReady = true;
-    console.log(`[Firebase Firestore] Connected to project: ${activeProjectId}, database: ${activeDatabaseId}`);
+    lastInitError = "";
+    console.log(
+      `[Firebase] Connected to project ${activeProjectId}, database ${activeDatabaseId}`,
+    );
     return true;
   } catch (err: any) {
-    console.warn('[Firebase Firestore] Initialization warning:', err.message);
+    lastInitError = String(err?.message || err);
     isFirestoreReady = false;
+    console.warn("[Firebase] Initialization failed:", lastInitError);
     return false;
   }
 }
 
-// Typed Database Operations against Firebase Firestore
+function safeDocId(value: unknown, fallback: string): string {
+  const candidate = String(value ?? "")
+    .replace(/[^A-Za-z0-9_-]/g, "")
+    .slice(0, 120);
+  return candidate || fallback;
+}
+
 export async function dbGetTunnels(): Promise<any[]> {
-  if (isFirestoreReady && firestoreDb) {
-    try {
-      const tunnelsCol = collection(firestoreDb, 'tunnels');
-      const snap = await getDocs(tunnelsCol);
-      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    } catch (err: any) {
-      console.warn('[Firebase Firestore] Failed fetching tunnels:', err.message);
-    }
-  }
-  return [];
+  if (!isFirestoreReady || !firestoreDb) return [];
+  const snap = await firestoreDb.collection("tunnels").get();
+  return snap.docs.map((d) => redactSecrets({ id: d.id, ...d.data() }));
 }
 
 export async function dbInsertTunnel(tunnel: any): Promise<any> {
-  const tunnelId = tunnel.id || `tun-${Date.now()}`;
-  const record = {
+  const tunnelId = safeDocId(tunnel.id, `tun-${Date.now()}`);
+  const record: Record<string, unknown> = {
     id: tunnelId,
     subdomain: tunnel.subdomain,
     target_port: Number(tunnel.target_port || tunnel.localPort || 8080),
-    protocol: tunnel.protocol || 'quic',
-    tls_status: tunnel.tls_status || 'active',
+    protocol: tunnel.protocol || "quic",
+    tls_status: tunnel.tls_status || "active",
     auth_enabled: Boolean(tunnel.auth_enabled),
     auth_user: tunnel.auth_user || null,
-    is_active: tunnel.is_active !== undefined ? tunnel.is_active : true,
-    total_requests: tunnel.total_requests || 0,
-    bytes_transferred: tunnel.bytes_transferred || 0,
-    avg_latency: tunnel.avg_latency || 0,
-    created_at: new Date().toISOString(),
-    last_ping_at: new Date().toISOString()
+    is_active: tunnel.is_active !== undefined ? Boolean(tunnel.is_active) : true,
+    total_requests: Number(tunnel.total_requests || 0),
+    bytes_transferred: Number(tunnel.bytes_transferred || 0),
+    avg_latency: Number(tunnel.avg_latency || 0),
+    created_at: tunnel.created_at || new Date().toISOString(),
+    last_ping_at: new Date().toISOString(),
   };
 
+  if (tunnel.token_hash !== undefined) {
+    record.token_hash = tunnel.token_hash;
+  }
+  if (tunnel.token_last4 !== undefined) {
+    record.token_last4 = tunnel.token_last4;
+  }
+
   if (isFirestoreReady && firestoreDb) {
-    try {
-      await setDoc(doc(firestoreDb, 'tunnels', tunnelId), record);
-      return record;
-    } catch (err: any) {
-      console.warn('[Firebase Firestore] Failed inserting tunnel:', err.message);
-    }
+    await firestoreDb.collection("tunnels").doc(tunnelId).set(record, { merge: true });
   }
   return record;
 }
 
 export async function dbDeleteTunnel(id: string): Promise<boolean> {
-  if (isFirestoreReady && firestoreDb) {
-    try {
-      await deleteDoc(doc(firestoreDb, 'tunnels', id));
-      return true;
-    } catch (err: any) {
-      console.warn('[Firebase Firestore] Failed deleting tunnel:', err.message);
-    }
-  }
-  return false;
+  if (!isFirestoreReady || !firestoreDb) return false;
+  await firestoreDb.collection("tunnels").doc(safeDocId(id, "invalid")).delete();
+  return true;
 }
 
 export async function dbInsertTrafficLog(logEntry: any): Promise<void> {
   if (!isFirestoreReady || !firestoreDb) return;
-
   try {
-    const logId = logEntry.id || `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-    const record = {
+    const logId = safeDocId(
+      logEntry.id,
+      `log-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`,
+    );
+    await firestoreDb.collection("traffic_logs").doc(logId).set({
       id: logId,
-      tunnel_id: logEntry.tunnelId || 'tun-prod-cloud',
-      subdomain: logEntry.subdomain || 'api',
+      tunnel_id: logEntry.tunnelId || null,
+      subdomain: logEntry.subdomain || null,
       timestamp: logEntry.timestamp || new Date().toISOString(),
-      method: logEntry.method || 'GET',
-      path: logEntry.path || '/',
-      status_code: logEntry.statusCode || 200,
-      latency_ms: logEntry.latencyMs || 1.2,
-      bytes_in: logEntry.bytesIn || 128,
-      bytes_out: logEntry.bytesOut || 512,
-      client_ip: logEntry.clientIp || '127.0.0.1',
-      blocked_by_shield: Boolean(logEntry.blockedByShield)
-    };
-    await setDoc(doc(firestoreDb, 'traffic_logs', logId), record);
-  } catch (err: any) {
-    // Non-blocking log insert
+      method: logEntry.method || "GET",
+      path: logEntry.path || "/",
+      status_code: Number(logEntry.statusCode || 200),
+      latency_ms: Number(logEntry.latencyMs || 0),
+      bytes_in: Number(logEntry.bytesIn || 0),
+      bytes_out: Number(logEntry.bytesOut || 0),
+      client_ip: logEntry.clientIp || "127.0.0.1",
+      blocked_by_shield: Boolean(logEntry.blockedByShield),
+    });
+  } catch {
+    // Traffic logging must never break request handling.
   }
 }
 
-export async function dbGetTrafficLogs(limitCount: number = 50): Promise<any[]> {
-  if (isFirestoreReady && firestoreDb) {
-    try {
-      const logsCol = collection(firestoreDb, 'traffic_logs');
-      const q = query(logsCol, orderBy('timestamp', 'desc'), fsLimit(limitCount));
-      const snap = await getDocs(q);
-      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    } catch (err: any) {
-      console.warn('[Firebase Firestore] Failed fetching logs:', err.message);
-    }
-  }
-  return [];
+export async function dbGetTrafficLogs(limitCount = 50): Promise<any[]> {
+  if (!isFirestoreReady || !firestoreDb) return [];
+  const safeLimit = Math.min(Math.max(Number(limitCount) || 50, 1), 100);
+  const snap = await firestoreDb
+    .collection("traffic_logs")
+    .orderBy("timestamp", "desc")
+    .limit(safeLimit)
+    .get();
+  return snap.docs.map((d) => redactSecrets({ id: d.id, ...d.data() }));
 }
 
 export async function dbGetUsers(): Promise<any[]> {
-  if (isFirestoreReady && firestoreDb) {
-    try {
-      const usersCol = collection(firestoreDb, 'users');
-      const snap = await getDocs(usersCol);
-      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    } catch (err: any) {
-      console.warn('[Firebase Firestore] Failed fetching users:', err.message);
-    }
-  }
-  return [];
+  if (!isFirestoreReady || !firestoreDb) return [];
+  const snap = await firestoreDb.collection("users").get();
+  return snap.docs.map((d) => redactSecrets({ id: d.id, ...d.data() }));
 }
 
-export async function dbGetCollectionDocs(collectionName: string, limitCount: number = 50): Promise<any[]> {
-  if (isFirestoreReady && firestoreDb) {
-    try {
-      const colRef = collection(firestoreDb, collectionName);
-      const q = query(colRef, fsLimit(limitCount));
-      const snap = await getDocs(q);
-      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    } catch (err: any) {
-      console.warn(`[Firebase Firestore] Failed fetching collection ${collectionName}:`, err.message);
-    }
+export async function dbGetCollectionDocs(collectionName: string, limitCount = 50): Promise<any[]> {
+  if (!isFirestoreReady || !firestoreDb) return [];
+  if (!isAllowedCollection(collectionName)) {
+    throw new Error("Collection is not exposed by the control plane");
   }
-  return [];
+  const safeLimit = Math.min(Math.max(Number(limitCount) || 50, 1), 100);
+  const snap = await firestoreDb.collection(collectionName).limit(safeLimit).get();
+  return snap.docs.map((d) => redactSecrets({ id: d.id, ...d.data() }));
 }
 
 export async function dbInsertSampleDoc(collectionName: string, data: any): Promise<any> {
-  if (isFirestoreReady && firestoreDb) {
-    try {
-      const docId = data.id || `${collectionName.slice(0, 3)}-${Date.now()}`;
-      const record = { ...data, id: docId, updated_at: new Date().toISOString() };
-      await setDoc(doc(firestoreDb, collectionName, docId), record);
-      return record;
-    } catch (err: any) {
-      console.warn(`[Firebase Firestore] Failed inserting to ${collectionName}:`, err.message);
-    }
+  if (!isAllowedCollection(collectionName)) {
+    throw new Error("Collection is not writable through the control plane");
   }
-  return null;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("Document body must be a JSON object");
+  }
+
+  const docId = safeDocId(data.id, `${collectionName.slice(0, 3)}-${Date.now()}`);
+  const record = redactSecrets({
+    ...data,
+    id: docId,
+    updated_at: new Date().toISOString(),
+  });
+
+  if (isFirestoreReady && firestoreDb) {
+    await firestoreDb.collection(collectionName).doc(docId).set(record, { merge: true });
+  }
+  return record;
 }
 
-// SQL Query Execution Engine running directly against Firebase Collections
-export async function executeQuery(sqlText: string, params: any[] = []): Promise<SqlQueryResult> {
+/**
+ * A deliberately narrow, read-only query interface over allowlisted Firestore
+ * collections. This is not a SQL engine and never accepts writes.
+ */
+export async function executeQuery(sqlText: string, _params: any[] = []): Promise<SqlQueryResult> {
   const start = performance.now();
-  const lower = sqlText.trim().toLowerCase();
+  const queryText = sqlText.trim();
 
-  let collectionName = 'tunnels';
-  if (lower.includes('traffic_logs') || lower.includes('traffic')) collectionName = 'traffic_logs';
-  else if (lower.includes('users') || lower.includes('accounts')) collectionName = 'users';
-  else if (lower.includes('rate_limit_rules')) collectionName = 'rate_limit_rules';
-  else if (lower.includes('tunnels')) collectionName = 'tunnels';
-
-  if (isFirestoreReady && firestoreDb) {
-    try {
-      const targetCol = collection(firestoreDb, collectionName);
-      let q = query(targetCol, fsLimit(50));
-      if (lower.includes('limit')) {
-        const match = lower.match(/limit\s+(\d+)/);
-        if (match) {
-          const l = parseInt(match[1], 10);
-          q = query(targetCol, fsLimit(Math.min(l, 100)));
-        }
-      }
-      const snap = await getDocs(q);
-      const rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      const latencyMs = Math.round((performance.now() - start) * 100) / 100;
-      const fields = rows.length > 0 ? Object.keys(rows[0]).map(name => ({ name })) : [{ name: 'id' }];
-
-      return {
-        rows,
-        rowCount: rows.length,
-        fields,
-        latencyMs,
-        source: 'firebase-firestore'
-      };
-    } catch (err: any) {
-      console.warn('[Firebase Firestore] Live query fallback:', err.message);
-    }
+  if (!/^select\b/i.test(queryText)) {
+    throw new Error("Only read-only SELECT queries are allowed");
+  }
+  if (/;/.test(queryText)) {
+    throw new Error("Multiple statements are not allowed");
   }
 
-  // Fallback if network is starting
-  const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+  const fromMatch = /\bfrom\s+([a-zA-Z0-9_]+)/i.exec(queryText);
+  const collectionName = fromMatch?.[1] || "tunnels";
+  if (!isAllowedCollection(collectionName)) {
+    throw new Error("Collection is not exposed by the control plane");
+  }
+
+  const limitMatch = /\blimit\s+(\d+)/i.exec(queryText);
+  const requestedLimit = limitMatch ? parseInt(limitMatch[1], 10) : 50;
+
+  if (isFirestoreReady && firestoreDb) {
+    const snap = await firestoreDb
+      .collection(collectionName)
+      .limit(Math.min(Math.max(requestedLimit, 1), 100))
+      .get();
+    const rows = snap.docs.map((d) => redactSecrets({ id: d.id, ...d.data() }));
+    const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+    const fields =
+      rows.length > 0 ? Object.keys(rows[0]).map((name) => ({ name })) : [{ name: "id" }];
+
+    return {
+      rows,
+      rowCount: rows.length,
+      fields,
+      latencyMs,
+      source: "firebase-firestore",
+    };
+  }
+
   return {
     rows: [],
     rowCount: 0,
-    fields: [{ name: 'id' }, { name: 'status' }],
-    latencyMs,
-    source: 'embedded-engine'
+    fields: [{ name: "id" }, { name: "status" }],
+    latencyMs: Math.round((performance.now() - start) * 100) / 100,
+    source: "embedded-engine",
   };
 }
 
 export function dbGetStatus() {
   return {
-    engine: 'Firebase Firestore (Google Cloud)',
+    engine: "Firebase Firestore (Admin SDK)",
     isReady: isFirestoreReady,
-    projectId: activeProjectId || 'influential-graph-nj1d7',
-    databaseId: activeDatabaseId || 'ai-studio-edgeproxytraffic-8ae9f396-b7a2-4678-b3cb-c06f9bd459fd',
-    status: isFirestoreReady ? 'connected' : 'initializing',
-    collections: ['tunnels', 'traffic_logs', 'users', 'rate_limit_rules', 'certificates']
+    projectId: activeProjectId || null,
+    databaseId: activeDatabaseId,
+    status: isFirestoreReady ? "connected" : "not-configured",
+    error: isFirestoreReady ? null : "not-connected",
+    collections: ["tunnels", "traffic_logs", "users", "rate_limit_rules", "certificates"],
   };
 }
 
 export async function dbGetCertificates(): Promise<any[]> {
-  if (isFirestoreReady && firestoreDb) {
-    try {
-      const colRef = collection(firestoreDb, 'certificates');
-      const snap = await getDocs(colRef);
-      return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    } catch (err: any) {
-      console.warn('[Firebase Firestore] Failed fetching certificates:', err.message);
-    }
-  }
-  return [];
+  if (!isFirestoreReady || !firestoreDb) return [];
+  const snap = await firestoreDb.collection("certificates").get();
+  return snap.docs.map((d) => redactSecrets({ id: d.id, ...d.data() }));
 }
 
-export async function dbSaveCertificate(cert: any): Promise<void> {
-  if (isFirestoreReady && firestoreDb && cert && cert.id) {
-    try {
-      await setDoc(doc(firestoreDb, 'certificates', cert.id), cert);
-    } catch (err: any) {
-      console.warn('[Firebase Firestore] Failed saving certificate:', err.message);
-    }
-  }
+export async function dbSaveCertificate(certificateRecord: any): Promise<void> {
+  if (!isFirestoreReady || !firestoreDb || !certificateRecord?.id) return;
+  const id = safeDocId(certificateRecord.id, `cert-${Date.now()}`);
+  await firestoreDb
+    .collection("certificates")
+    .doc(id)
+    .set(redactSecrets({ ...certificateRecord, id }), { merge: true });
 }

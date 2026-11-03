@@ -48,13 +48,14 @@
       "properties": {
         "id": { "type": "string", "description": "User UUID" },
         "email": { "type": "string", "format": "email" },
-        "api_key": { "type": "string" },
-        "plan_tier": { "type": "string", "enum": ["starter", "pro", "enterprise"] },
+        "api_key_hash": { "type": "string", "description": "SHA-256 hex digest of the API key" },
+        "api_key_last4": { "type": "string", "description": "Last four characters, for display only" },
+        "plan_tier": { "type": "string", "enum": ["developer", "team", "enterprise"] },
         "max_tunnels": { "type": "number" },
         "max_rps": { "type": "number" },
         "created_at": { "type": "string", "format": "date-time" }
       },
-      "required": ["id", "email", "api_key", "plan_tier"]
+      "required": ["id", "email", "api_key_hash", "plan_tier"]
     },
     "RateLimitRule": {
       "title": "RateLimitRule",

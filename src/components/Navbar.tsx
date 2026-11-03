@@ -45,8 +45,8 @@ export const Navbar: React.FC<NavbarProps> = ({
     ua: {
       appName: 'EdgeProxy',
       badge: 'Traffic Mesh',
-      edgeStatus: 'Edge Node: Frankfurt (VPS-01)',
-      tunnelQuic: 'QUIC Тунель: Активний',
+      edgeStatus: 'Edge Node: Local',
+      tunnelQuic: 'TCP Тунель: Активний',
       rtt: 'RTT',
       navMesh: 'Архітектура',
       navProtocol: 'Бінарний Протокол',
@@ -65,8 +65,8 @@ export const Navbar: React.FC<NavbarProps> = ({
     en: {
       appName: 'EdgeProxy',
       badge: 'Traffic Mesh',
-      edgeStatus: 'Edge Node: Frankfurt (VPS-01)',
-      tunnelQuic: 'QUIC Tunnel: Active',
+      edgeStatus: 'Edge Node: Local',
+      tunnelQuic: 'TCP Tunnel: Active',
       rtt: 'RTT',
       navMesh: 'Architecture',
       navProtocol: 'Binary Protocol',

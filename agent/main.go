@@ -18,6 +18,7 @@ func main() {
 	subdomain := flag.String("subdomain", "", "Requested custom subdomain (e.g. 'myapi')")
 	port := flag.Int("port", 3000, "Target local port to expose (e.g. 3000, 8080)")
 	token := flag.String("token", "", "EdgeProxy auth token (strictly required)")
+	domain := flag.String("domain", "edgeproxy.mesh", "Base domain shown in the public URL")
 	autoDiscover := flag.Bool("auto", true, "Auto-discover active listening ports if port is closed")
 	flag.Parse()
 
@@ -35,7 +36,7 @@ func main() {
 	fmt.Println("  EdgeProxy Local Agent (CLI v1.0.0-PROD) - Zero-Config Tunnel  ")
 	fmt.Println("================================================================")
 	fmt.Printf("  Target Port     : http://127.0.0.1:%d\n", *port)
-	fmt.Printf("  Assigned Domain : https://%s.edgeproxy.mesh\n", *subdomain)
+	fmt.Printf("  Assigned Domain : https://%s.%s\n", *subdomain, *domain)
 	fmt.Printf("  Gateway Remote  : %s\n", *gatewayAddr)
 	fmt.Println("----------------------------------------------------------------")
 
@@ -55,7 +56,7 @@ func main() {
 		fmt.Printf("✅ Local service verified on port :%d\n", *port)
 	}
 
-	agent := client.NewTunnelClient(*gatewayAddr, *subdomain, *port, authToken)
+	agent := client.NewTunnelClient(*gatewayAddr, *subdomain, *domain, *port, authToken)
 
 	// Graceful termination handling
 	sigChan := make(chan os.Signal, 1)

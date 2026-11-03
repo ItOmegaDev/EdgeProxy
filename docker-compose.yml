@@ -1,41 +1,90 @@
-version: '3.8'
-
 services:
-  # Edge Gateway (High-Load Go Reverse Proxy & Multiplexer)
+  # Edge gateway: public HTTP/HTTPS ingress and the agent tunnel listener.
   edge-gateway:
     build:
       context: .
       dockerfile: Dockerfile.gateway
     container_name: edgeproxy-gateway
     restart: unless-stopped
-    ports:
-      - "80:80"       # Public HTTP Ingress
-      - "443:443"     # Public HTTPS (ACME TLS)
-      - "4242:4242"   # TCP Multiplexed Control Plane for Agents
+    init: true
+    command:
+      - -http-port
+      - "8080"
+      - -tls-port
+      - "8443"
+      - -tunnel-port
+      - "4242"
+      - -internal-addr
+      - "0.0.0.0:8081"
+      - -cert-dir
+      - /app/certs
+      - -domain
+      - ${BASE_DOMAIN:-edgeproxy.mesh}
+      - -rps
+      - ${RATE_LIMIT_RPS:-100}
+      - -burst
+      - ${BURST_CAPACITY:-150}
     environment:
-      - BASE_DOMAIN=edgeproxy.mesh
-      - RATE_LIMIT_RPS=100
-      - BURST_CAPACITY=150
+      - EDGEPROXY_INTERNAL_SECRET=${EDGEPROXY_INTERNAL_SECRET:?set EDGEPROXY_INTERNAL_SECRET in .env}
+    ports:
+      - "80:8080"
+      - "443:8443"
+      - "4242:4242"
+    expose:
+      # Private IPC for the dashboard container; never published to the host.
+      - "8081"
+    volumes:
+      - edge-certs:/app/certs
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     networks:
       - edgeproxy-net
 
-  # Web Control Plane & Telemetry Dashboard
+  # Control plane and dashboard. Published on loopback only; use an SSH tunnel
+  # or a properly authenticated reverse proxy for remote access.
   web-dashboard:
     build:
       context: .
       dockerfile: Dockerfile.dashboard
     container_name: edgeproxy-dashboard
     restart: unless-stopped
-    ports:
-      - "3000:3000"
+    init: true
     environment:
       - PORT=3000
-      - GATEWAY_API_URL=http://edge-gateway:80
+      - HOST=0.0.0.0
+      - EDGEPROXY_API_KEY=${EDGEPROXY_API_KEY:?set EDGEPROXY_API_KEY in .env}
+      - EDGEPROXY_ALLOWED_ORIGINS=${EDGEPROXY_ALLOWED_ORIGINS:-}
+      - EDGEPROXY_INTERNAL_SECRET=${EDGEPROXY_INTERNAL_SECRET:?set EDGEPROXY_INTERNAL_SECRET in .env}
+      - GATEWAY_INTERNAL_URL=http://edge-gateway:8081
+      - GATEWAY_PUBLIC_URL=http://edge-gateway:8080
+      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID:-}
+      - FIREBASE_DATABASE_ID=${FIREBASE_DATABASE_ID:-(default)}
+      - FIREBASE_SERVICE_ACCOUNT_JSON=${FIREBASE_SERVICE_ACCOUNT_JSON:-}
+    ports:
+      - "127.0.0.1:3000:3000"
     depends_on:
-      - edge-gateway
+      edge-gateway:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
     networks:
       - edgeproxy-net
 
 networks:
   edgeproxy-net:
     driver: bridge
+
+volumes:
+  edge-certs:

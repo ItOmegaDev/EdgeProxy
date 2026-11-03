@@ -2,11 +2,12 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -34,27 +35,52 @@ func main() {
 	baseDomain := flag.String("domain", "edgeproxy.mesh", "Base wildcard domain for tunnels")
 	rateLimitRps := flag.Float64("rps", 100.0, "Per-IP allowed RPS before burst shield")
 	burstCapacity := flag.Float64("burst", 150.0, "Maximum burst capacity for token bucket")
-	controlPlaneURL := flag.String("control-plane", "http://127.0.0.1:3000", "Node.js Control Plane API URL")
-	certDir := flag.String("cert-dir", "./certs", "Directory for ACME and TLS certificates")
+	internalAddr := flag.String("internal-addr", envOrDefault("EDGEPROXY_INTERNAL_ADDR", "127.0.0.1:8081"), "Private control-plane IPC address")
+	internalSecret := flag.String("internal-secret", os.Getenv("EDGEPROXY_INTERNAL_SECRET"), "Shared secret for private control-plane IPC (required to enable it)")
+	certDir := flag.String("cert-dir", "./certs", "Directory for TLS certificates")
 	flag.Parse()
 
+	if *internalSecret != "" && len(*internalSecret) < 24 {
+		log.Fatalf("[FATAL] EDGEPROXY_INTERNAL_SECRET must be at least 24 characters")
+	}
+	if _, _, err := net.SplitHostPort(*internalAddr); err != nil {
+		log.Fatalf("[FATAL] Invalid -internal-addr %q: %v", *internalAddr, err)
+	}
+
 	log.Printf("==========================================================")
-	log.Printf("  EdgeProxy Gateway (v1.0.0-PROD) - High-Load Edge Router ")
+	log.Printf("  EdgeProxy Gateway (v1.0.0) - High-Load Edge Router ")
 	log.Printf("  Base Domain: *.%s", *baseDomain)
 	log.Printf("  Ingress Ports: HTTP :%d | HTTPS :%d | Tunnel :%d", *httpPort, *tlsPort, *tunnelPort)
 	log.Printf("  Shield: TokenBucket %.0f RPS / %.0f Burst with Auto-Jail", *rateLimitRps, *burstCapacity)
-	log.Printf("  TLS Termination: Real ECDSA P-256 + ACME SNI on :%d", *tlsPort)
-	log.Printf("  Control Plane Sync: %s", *controlPlaneURL)
+	log.Printf("  TLS: Self-signed ECDSA P-256 with SNI on :%d (not publicly trusted)", *tlsPort)
+	log.Printf("  Internal IPC: %s (secret configured: %t)", *internalAddr, *internalSecret != "")
 	log.Printf("==========================================================")
 
 	router := proxy.NewRouter(*baseDomain, *rateLimitRps, *burstCapacity)
 	certMgr := acme.NewCertManager(*baseDomain, *certDir)
 
-	// Periodic synchronization of allowed tunnels and tokens from Control Plane DB
-	go syncTunnelsFromControlPlane(router, *controlPlaneURL)
-
-	// Setup Internal Management Handlers for Control Plane IPC
-	setupInternalHandlers(router, certMgr)
+	// Private IPC for the control plane. It is never attached to the public
+	// listener and is disabled unless a shared secret is configured.
+	var internalServer *http.Server
+	if *internalSecret != "" {
+		internalMux := http.NewServeMux()
+		setupInternalHandlers(internalMux, router, certMgr)
+		internalServer = &http.Server{
+			Addr:              *internalAddr,
+			Handler:           internalAuth(*internalSecret, internalMux),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+		}
+		go func() {
+			log.Printf("[INTERNAL] Listening on %s (shared-secret auth)", *internalAddr)
+			if err := internalServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("[WARN] Internal IPC server error: %v", err)
+			}
+		}()
+	} else {
+		log.Printf("[INTERNAL] Disabled: EDGEPROXY_INTERNAL_SECRET is not set")
+	}
 
 	// Start Tunnel Ingress Listener for Agents (TCP multiplexed wire)
 	tunnelListener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *tunnelPort))
@@ -75,28 +101,30 @@ func main() {
 		}
 	}()
 
-	// Start Public HTTP Server (with ACME HTTP-01 challenge pass-through)
+	// Start public HTTP server.
 	httpServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", *httpPort),
-		Handler: router,
+		Addr:              fmt.Sprintf(":%d", *httpPort),
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
-		log.Printf("[HTTP-INGRESS] Listening on :%d (HTTP / ACME HTTP-01 ready)", *httpPort)
+		log.Printf("[HTTP-INGRESS] Listening on :%d", *httpPort)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("[WARN] HTTP server error: %v", err)
 		}
 	}()
 
-	// Start Real HTTPS Server on Port 443 with TLS Termination
+	// Start HTTPS server with SNI-based TLS termination.
 	tlsServer := &http.Server{
-		Addr:      fmt.Sprintf(":%d", *tlsPort),
-		Handler:   router,
-		TLSConfig: certMgr.TLSConfig(),
+		Addr:              fmt.Sprintf(":%d", *tlsPort),
+		Handler:           router,
+		TLSConfig:         certMgr.TLSConfig(),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
-		log.Printf("[HTTPS-INGRESS] Starting real TLS termination server on :%d (SNI ECDSA)", *tlsPort)
+		log.Printf("[HTTPS-INGRESS] Starting TLS termination on :%d (self-signed SNI)", *tlsPort)
 		// ListenAndServeTLS with empty strings uses TLSConfig.GetCertificate
 		if err := tlsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 			log.Printf("[WARN] HTTPS server error (port %d may require elevated privileges): %v", *tlsPort, err)
@@ -113,10 +141,16 @@ func main() {
 	defer cancel()
 	_ = httpServer.Shutdown(ctx)
 	_ = tlsServer.Shutdown(ctx)
+	if internalServer != nil {
+		_ = internalServer.Shutdown(ctx)
+	}
 }
 
 func handleAgentConnection(router *proxy.Router, conn net.Conn) {
 	defer conn.Close()
+
+	// The handshake must complete quickly; slow clients cannot hold a slot open.
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// Handshake: read first SYN frame containing JSON handshake
 	frame, err := protocol.ReadFrame(conn)
@@ -131,24 +165,27 @@ func handleAgentConnection(router *proxy.Router, conn net.Conn) {
 	}
 
 	var handshake AgentHandshakePayload
-	payloadStr := string(frame.Payload)
+	payloadStr := strings.TrimSpace(string(frame.Payload))
 
 	if strings.HasPrefix(payloadStr, "{") {
-		_ = json.Unmarshal(frame.Payload, &handshake)
+		if err := json.Unmarshal(frame.Payload, &handshake); err != nil {
+			log.Printf("[AGENT-HANDSHAKE] Invalid JSON handshake: %v", err)
+			return
+		}
 	} else {
-		// Legacy plain subdomain fallback
+		// Legacy plain subdomain fallback (token is still required separately).
 		handshake.Subdomain = payloadStr
 	}
 
-	if handshake.Subdomain == "" {
-		log.Printf("[AGENT-HANDSHAKE] Handshake missing requested subdomain")
+	handshake.Subdomain = strings.ToLower(strings.TrimSpace(handshake.Subdomain))
+	if !proxy.ValidSubdomain(handshake.Subdomain) {
+		log.Printf("[AGENT-HANDSHAKE] Invalid subdomain %q", handshake.Subdomain)
 		return
 	}
 
-	// Verify authorization token against Control Plane / DB state
+	// Verify authorization token against Control Plane / DB state. Deny by default.
 	if !router.VerifyAuthorization(handshake.Subdomain, handshake.Token) {
-		log.Printf("[AGENT-AUTH-REJECTED] Unauthorized agent connection for subdomain '%s' (token invalid)", handshake.Subdomain)
-		// Send RST frame and close
+		log.Printf("[AGENT-AUTH-REJECTED] Unauthorized agent connection for subdomain '%s'", handshake.Subdomain)
 		rstFrame := &protocol.Frame{
 			StreamID: 0,
 			Type:     protocol.FrameRst,
@@ -158,8 +195,20 @@ func handleAgentConnection(router *proxy.Router, conn net.Conn) {
 		return
 	}
 
+	_ = conn.SetDeadline(time.Time{})
+
 	session := router.RegisterSession(handshake.Subdomain, conn)
 	defer router.UnregisterSession(handshake.Subdomain)
+
+	// Acknowledge the handshake so the agent can fail fast on a rejected token
+	// instead of assuming the tunnel is online.
+	session.WriterLock.Lock()
+	_, _ = session.Conn.Write((&protocol.Frame{
+		StreamID: 0,
+		Type:     protocol.FrameAck,
+		Payload:  []byte(`{"status":"ready"}`),
+	}).Encode())
+	session.WriterLock.Unlock()
 
 	// Demux loop: read frames from agent wire
 	for {
@@ -170,6 +219,14 @@ func handleAgentConnection(router *proxy.Router, conn net.Conn) {
 		}
 
 		switch f.Type {
+		case protocol.FramePing:
+			session.WriterLock.Lock()
+			_, _ = session.Conn.Write((&protocol.Frame{
+				StreamID: f.StreamID,
+				Type:     protocol.FramePong,
+			}).Encode())
+			session.WriterLock.Unlock()
+
 		case protocol.FrameMetrics:
 			// Record real agent telemetry
 			router.RecordTelemetry(handshake.Subdomain, f.Payload)
@@ -203,89 +260,87 @@ func handleAgentConnection(router *proxy.Router, conn net.Conn) {
 	}
 }
 
-// syncTunnelsFromControlPlane polls Control Plane database periodically to keep Data Plane synced
-func syncTunnelsFromControlPlane(router *proxy.Router, controlPlaneURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	syncFunc := func() {
-		resp, err := client.Get(fmt.Sprintf("%s/api/tunnels", controlPlaneURL))
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-
-		var rawTunnels []struct {
-			Subdomain string `json:"subdomain"`
-			Token     string `json:"token"`
-			Status    string `json:"status"`
-			MaxRps    int    `json:"maxRps"`
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&rawTunnels); err != nil {
-			return
-		}
-
-		allowed := make([]proxy.AllowedTunnelConfig, 0, len(rawTunnels))
-		for _, t := range rawTunnels {
-			allowed = append(allowed, proxy.AllowedTunnelConfig{
-				Subdomain: t.Subdomain,
-				AuthToken: t.Token,
-				MaxRPS:    float64(t.MaxRps),
-				IsActive:  t.Status == "active",
-			})
-		}
-		router.SyncAllowedTunnels(allowed)
+func envOrDefault(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
 	}
-
-	// Initial sync
-	syncFunc()
-
-	for range ticker.C {
-		syncFunc()
-	}
+	return fallback
 }
 
-// setupInternalHandlers binds internal IPC endpoints on standard HTTP mux for Control Plane
-func setupInternalHandlers(router *proxy.Router, certMgr *acme.CertManager) {
-	http.HandleFunc("/internal/certs", func(w http.ResponseWriter, r *http.Request) {
+func internalAuth(secret string, next http.Handler) http.Handler {
+	expected := sha256.Sum256([]byte(secret))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		presented := r.Header.Get("X-EdgeProxy-Internal")
+		actual := sha256.Sum256([]byte(presented))
+		if presented == "" || subtle.ConstantTimeCompare(expected[:], actual[:]) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// setupInternalHandlers binds private IPC endpoints for the control plane.
+// The caller mounts them on a separate listener that is not the public ingress.
+func setupInternalHandlers(mux *http.ServeMux, router *proxy.Router, certMgr *acme.CertManager) {
+	mux.HandleFunc("/internal/certs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(certMgr.ListCertificates())
 	})
 
-	http.HandleFunc("/internal/certs/issue", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/internal/certs/issue", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var req struct {
 			Domain   string `json:"domain"`
 			Wildcard bool   `json:"wildcard"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), 400)
+			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
 		meta, err := certMgr.IssueOrRenew(req.Domain, req.Wildcard)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			http.Error(w, "certificate issuance failed", http.StatusBadRequest)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(meta)
 	})
 
-	http.HandleFunc("/internal/sessions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/internal/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(router.GetActiveSessionsSnapshot())
 	})
 
-	http.HandleFunc("/internal/tunnels/sync", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+	mux.HandleFunc("/internal/tunnels/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var configs []proxy.AllowedTunnelConfig
-		if err := json.Unmarshal(body, &configs); err != nil {
-			http.Error(w, err.Error(), 400)
+		if err := json.NewDecoder(r.Body).Decode(&configs); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
 		router.SyncAllowedTunnels(configs)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"synced"}`))
+		_, _ = w.Write([]byte(`{"status":"synced"}`))
 	})
 }

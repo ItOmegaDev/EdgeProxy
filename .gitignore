@@ -6,7 +6,9 @@ node_modules/
 # Production build outputs
 dist/
 build/
+bin/
 coverage/
+certs/
 
 # Environment files and secrets
 .env

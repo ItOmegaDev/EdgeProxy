@@ -1,0 +1,17 @@
+node_modules
+dist
+build
+bin
+.git
+.github
+certs
+*.log
+.env
+.env.*
+!.env.example
+firebase-applet-config.json
+service-account*.json
+*credentials*.json
+*.pem
+*.key
+*.crt

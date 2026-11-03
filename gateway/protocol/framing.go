@@ -12,11 +12,11 @@ const HeaderSize = 9
 
 // Frame types for EdgeProxy multiplexing
 const (
-	FrameSyn  byte = 0x01 // Stream open request
-	FrameData byte = 0x02 // Data payload
-	FrameFin  byte = 0x03 // Stream close
-	FramePing byte = 0x04 // Keep-alive ping
-	FramePong byte = 0x05 // Keep-alive pong
+	FrameSyn     byte = 0x01 // Stream open request
+	FrameData    byte = 0x02 // Data payload
+	FrameFin     byte = 0x03 // Stream close
+	FramePing    byte = 0x04 // Keep-alive ping
+	FramePong    byte = 0x05 // Keep-alive pong
 	FrameRst     byte = 0x06 // Stream abort/reset
 	FrameAck     byte = 0x07 // Window/credit acknowledgement for flow control
 	FrameMetrics byte = 0x08 // Agent local telemetry metrics report
@@ -47,7 +47,7 @@ func (f *Frame) Encode() []byte {
 	return buf
 }
 
-// ReadFrame reads and decodes a single frame from an io.Reader (zero-copy buffer allocation)
+// ReadFrame reads and decodes a single frame from an io.Reader.
 func ReadFrame(r io.Reader) (*Frame, error) {
 	header := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -61,6 +61,9 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	// Max 64KB per frame to avoid memory exhaustion
 	if length > 65536 {
 		return nil, fmt.Errorf("%w: %d bytes", ErrPayloadTooLarge, length)
+	}
+	if !ValidFrameType(frameType) {
+		return nil, fmt.Errorf("%w: unknown type 0x%02x", ErrInvalidFrame, frameType)
 	}
 
 	payload := make([]byte, length)
@@ -76,4 +79,14 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 		Length:   length,
 		Payload:  payload,
 	}, nil
+}
+
+// ValidFrameType reports whether the frame type is part of the wire protocol.
+func ValidFrameType(frameType byte) bool {
+	switch frameType {
+	case FrameSyn, FrameData, FrameFin, FramePing, FramePong, FrameRst, FrameAck, FrameMetrics:
+		return true
+	default:
+		return false
+	}
 }

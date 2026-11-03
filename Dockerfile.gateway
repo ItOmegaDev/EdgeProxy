@@ -1,19 +1,29 @@
-# Multi-stage Go build for Edge Gateway
+# Multi-stage Go build for the EdgeProxy gateway.
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
-COPY go.work ./
 COPY gateway/ ./gateway/
-COPY agent/ ./agent/
 
 WORKDIR /app/gateway
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bin/edgeproxy-gateway .
+RUN GOWORK=off CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bin/edgeproxy-gateway .
 
-# Final minimal distroless/scratch container
-FROM alpine:3.19
-RUN apk --no-cache add ca-certificates tzdata
-WORKDIR /
+# Minimal runtime image, non-root, unprivileged ports only.
+FROM alpine:3.20
+
+RUN apk --no-cache add ca-certificates tzdata \
+    && addgroup -g 10001 -S edgeproxy \
+    && adduser -u 10001 -S -G edgeproxy -H -h /app edgeproxy \
+    && mkdir -p /app/certs \
+    && chown -R 10001:10001 /app
+
+WORKDIR /app
 COPY --from=builder /bin/edgeproxy-gateway /usr/local/bin/edgeproxy-gateway
 
-EXPOSE 80 443 4242
+USER 10001:10001
+
+EXPOSE 8080 8443 4242
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1
+
 ENTRYPOINT ["/usr/local/bin/edgeproxy-gateway"]
+CMD ["-http-port", "8080", "-tls-port", "8443", "-tunnel-port", "4242", "-cert-dir", "/app/certs"]

@@ -9,7 +9,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     email VARCHAR(255) UNIQUE NOT NULL,
-    api_key VARCHAR(64) UNIQUE NOT NULL,
+    api_key_hash VARCHAR(64) UNIQUE NOT NULL,
     plan_tier VARCHAR(32) DEFAULT 'developer' CHECK (plan_tier IN ('developer', 'team', 'enterprise')),
     max_tunnels INT DEFAULT 5,
     max_rps INT DEFAULT 100,
@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS tunnels (
     tls_status VARCHAR(32) DEFAULT 'active' CHECK (tls_status IN ('pending', 'active', 'renewing', 'failed')),
     auth_enabled BOOLEAN DEFAULT FALSE,
     auth_user VARCHAR(128),
-    auth_pass VARCHAR(255),
+    -- Store only a password hash (Argon2id/bcrypt), never plaintext.
+    auth_pass_hash VARCHAR(255),
     ip_allowlist TEXT[] DEFAULT '{}',
     is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,

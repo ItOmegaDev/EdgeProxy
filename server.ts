@@ -1,11 +1,13 @@
+import "dotenv/config";
 import express from "express";
 import http from "http";
+import https from "https";
 import path from "path";
-import fs from "fs";
 import net from "net";
 import crypto from "crypto";
 import os from "os";
 import { WebSocketServer, WebSocket } from "ws";
+import type { Duplex } from "stream";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import {
@@ -22,10 +24,58 @@ import {
   dbGetCertificates,
   dbSaveCertificate,
 } from "./src/server/db";
+import {
+  MIN_API_KEY_LENGTH,
+  extractBearer,
+  generateToken,
+  hashToken,
+  isAllowedCollection,
+  isValidIp,
+  timingSafeEqual,
+  validateSubdomain,
+} from "./src/server/security";
 
-const PORT = 3000;
+// ==========================================
+// Runtime configuration (deny by default)
+// ==========================================
+
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST?.trim() || "127.0.0.1";
+const API_KEY = process.env.EDGEPROXY_API_KEY?.trim() || "";
+const GATEWAY_INTERNAL_URL = (process.env.GATEWAY_INTERNAL_URL?.trim() || "http://127.0.0.1:8081").replace(/\/+$/, "");
+const GATEWAY_PUBLIC_URL = (process.env.GATEWAY_PUBLIC_URL?.trim() || "http://127.0.0.1:80").replace(/\/+$/, "");
+const GATEWAY_INTERNAL_SECRET = process.env.EDGEPROXY_INTERNAL_SECRET?.trim() || "";
+const EXTRA_ALLOWED_ORIGINS = (process.env.EDGEPROXY_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+function isLoopbackHost(host: string): boolean {
+  return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
+if (!isLoopbackHost(HOST) && !API_KEY) {
+  // Binding an admin surface to a network interface without authentication is
+  // forbidden. Fail closed instead of exposing the control plane.
+  console.error(
+    "[FATAL] HOST is not loopback but EDGEPROXY_API_KEY is empty. " +
+      "Set a strong API key or bind HOST=127.0.0.1.",
+  );
+  process.exit(1);
+}
+
+if (API_KEY && (API_KEY.length < MIN_API_KEY_LENGTH || !/^[A-Za-z0-9._~-]+$/.test(API_KEY))) {
+  console.error(
+    `[FATAL] EDGEPROXY_API_KEY must be at least ${MIN_API_KEY_LENGTH} chars and URL-safe ` +
+      "(A-Z, a-z, 0-9, '.', '_', '~', '-').",
+  );
+  process.exit(1);
+}
+
 const app = express();
-app.use(express.json());
+app.disable("x-powered-by");
+app.set("trust proxy", false);
+app.use(express.json({ limit: "1mb", strict: true }));
 
 // Lazy-initialized Gemini AI Client
 let aiClient: GoogleGenAI | null = null;
@@ -51,7 +101,12 @@ export interface TunnelRecord {
   tlsStatus: "active" | "renewing" | "failed";
   authEnabled: boolean;
   authUser?: string;
+  /** Whether the tunnel is allowed to accept an agent at all. */
+  enabled: boolean;
+  /** Only populated on the create/rotate response; never persisted or listed. */
   token?: string;
+  tokenHash?: string;
+  tokenLast4?: string;
   maxRps?: number;
   totalRequests: number;
   bytesTransferred: number;
@@ -83,7 +138,7 @@ export interface CertificateRecord {
   validFrom: string;
   validTo: string;
   daysRemaining: number;
-  challengeType: "DNS-01" | "HTTP-01" | "TLS-ALPN-01";
+  challengeType: "DNS-01" | "HTTP-01" | "TLS-ALPN-01" | "SELF-SIGNED";
   sanList: string[];
   ocspStapled: boolean;
   fingerprint: string;
@@ -140,7 +195,7 @@ function recordRequest(entry: LogEntry) {
   if (logs.length > 500) logs.pop();
   requestTimestamps.push(Date.now());
 
-  // Persist to PostgreSQL / Relational DB
+  // Persist to Firebase / Firestore
   dbInsertTrafficLog(entry);
 
   // Update tunnel stats
@@ -157,8 +212,72 @@ function recordRequest(entry: LogEntry) {
 // Create HTTP server
 const server = http.createServer(app);
 
-// Attach WebSocket Server
-const wss = new WebSocketServer({ server, path: "/ws" });
+// Attach WebSocket Server. Upgrades are authenticated manually so the token can
+// travel in a header (Sec-WebSocket-Protocol) instead of the URL.
+const wss = new WebSocketServer({
+  noServer: true,
+  handleProtocols(protocols) {
+    // The browser sends ["edgeproxy", <api-key>]; only the public name is echoed.
+    return protocols.has("edgeproxy") ? "edgeproxy" : false;
+  },
+});
+
+function isLoopbackRequest(req: http.IncomingMessage): boolean {
+  const address = req.socket.remoteAddress || "";
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+function isAllowedOrigin(origin: string | undefined, host: string | undefined): boolean {
+  if (!origin) return true; // non-browser clients (curl, agents)
+  if (EXTRA_ALLOWED_ORIGINS.includes(origin)) return true;
+  if (!host) return false;
+  return origin === `http://${host}` || origin === `https://${host}`;
+}
+
+function rejectUpgrade(socket: Duplex, status: string, reason: string) {
+  socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+  socket.destroy();
+}
+
+server.on("upgrade", (req, socket, head) => {
+  let pathname = "";
+  try {
+    pathname = new URL(req.url || "/", "http://localhost").pathname;
+  } catch {
+    rejectUpgrade(socket, "400", "Bad Request");
+    return;
+  }
+
+  if (pathname !== "/ws") {
+    rejectUpgrade(socket, "404", "Not Found");
+    return;
+  }
+
+  if (!isAllowedOrigin(req.headers.origin, req.headers.host)) {
+    rejectUpgrade(socket, "403", "Forbidden");
+    return;
+  }
+
+  if (API_KEY) {
+    const protocols = String(req.headers["sec-websocket-protocol"] || "")
+      .split(",")
+      .map((value) => value.trim());
+    const presented = protocols[1];
+    if (!presented || !timingSafeEqual(presented, API_KEY)) {
+      rejectUpgrade(socket, "401", "Unauthorized");
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+    return;
+  }
+
+  if (!isLoopbackRequest(req)) {
+    rejectUpgrade(socket, "403", "Forbidden");
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+});
 
 function broadcastWs(type: string, data: any) {
   const msg = JSON.stringify({ type, data, timestamp: new Date().toISOString() });
@@ -216,19 +335,115 @@ setInterval(() => {
 // REST API Endpoints
 // ==========================================
 
-app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() });
+// Security headers and same-origin enforcement for every response.
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+
+  if (process.env.NODE_ENV === "production") {
+    res.setHeader(
+      "Content-Security-Policy",
+      [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com",
+        "img-src 'self' data:",
+        "connect-src 'self' ws: wss:",
+        "frame-ancestors 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+      ].join("; "),
+    );
+  }
+
+  const origin = req.headers.origin;
+  if (!isAllowedOrigin(origin, req.headers.host)) {
+    return res.status(403).json({ error: "Cross-origin request rejected" });
+  }
+
+  // Explicitly allowlisted cross-origin clients get a narrow CORS grant.
+  if (origin && EXTRA_ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-EdgeProxy-CSRF");
+    res.setHeader("Access-Control-Max-Age", "600");
+  }
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  next();
 });
+
+// Liveness only. Deliberately contains no topology, credentials or metrics.
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok" });
+});
+
+/**
+ * Admin API gate.
+ *
+ * - With EDGEPROXY_API_KEY set: a Bearer token is mandatory.
+ * - Without a key: the API is reachable only from loopback and mutations must
+ *   carry the custom `X-EdgeProxy-CSRF: 1` header (blocks drive-by browser CSRF).
+ */
+app.use("/api", (req, res, next) => {
+  if (API_KEY) {
+    const presented = extractBearer(req.headers.authorization);
+    if (!presented || !timingSafeEqual(presented, API_KEY)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    return next();
+  }
+
+  if (!isLoopbackRequest(req)) {
+    return res.status(403).json({ error: "Control plane is loopback-only" });
+  }
+
+  if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && req.headers["x-edgeproxy-csrf"] !== "1") {
+    return res.status(403).json({ error: "Missing CSRF header" });
+  }
+
+  next();
+});
+
+/** Serializes a tunnel without its credential hash or one-time token. */
+function publicTunnel(tunnel: TunnelRecord) {
+  const { token: _token, tokenHash: _tokenHash, ...rest } = tunnel;
+  return rest;
+}
+
+/** Calls the gateway's private IPC listener with the shared secret. */
+async function gatewayFetch(pathname: string, init: RequestInit = {}, timeoutMs = 1000) {
+  if (!GATEWAY_INTERNAL_SECRET) {
+    throw new Error("Gateway internal IPC is not configured");
+  }
+  const headers = new Headers(init.headers);
+  headers.set("X-EdgeProxy-Internal", GATEWAY_INTERNAL_SECRET);
+  if (init.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  return fetch(`${GATEWAY_INTERNAL_URL}${pathname}`, {
+    ...init,
+    headers,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
 
 app.get("/api/status", (req, res) => {
   const telemetry = getRealTelemetry();
   res.json({
     gateway: {
       status: "operational",
-      version: "EdgeProxy v1.0.0-PROD (Go Core)",
+      version: "EdgeProxy v1.0.0",
       node: os.hostname(),
-      ip: "127.0.0.1",
-      ports: { http: 3000, tunnel: 4242 },
+      ip: HOST,
+      ports: { controlPlane: PORT, tunnel: 4242 },
       tlsCert: certificates.length > 0 ? certificates[0].domain : "None issued",
     },
     connectedClients: wss.clients.size,
@@ -240,59 +455,76 @@ app.get("/api/status", (req, res) => {
   });
 });
 
-// Sync allowed tunnels state to Go Gateway
+// Sync the allowed tunnel set (subdomain + token hash) to the Go gateway.
+let lastSyncWarningAt = 0;
 async function syncGatewayTunnels() {
+  if (!GATEWAY_INTERNAL_SECRET) return;
+
+  const payload = tunnels.map((t) => ({
+    subdomain: t.subdomain,
+    tokenHash: t.tokenHash || "",
+    maxRps: t.maxRps || 100,
+    isActive: t.enabled,
+  }));
+
   try {
-    const payload = tunnels.map((t) => ({
-      subdomain: t.subdomain,
-      token: t.token || "edg_tok_default",
-      maxRps: t.maxRps || 100,
-      isActive: t.status === "online",
-    }));
-    await fetch("http://127.0.0.1:80/internal/tunnels/sync", {
+    const response = await gatewayFetch("/internal/tunnels/sync", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(1000),
     });
-  } catch (_) {}
+    if (!response.ok && Date.now() - lastSyncWarningAt > 60_000) {
+      lastSyncWarningAt = Date.now();
+      console.warn(`[Gateway] Tunnel sync rejected with HTTP ${response.status}`);
+    }
+  } catch {
+    if (Date.now() - lastSyncWarningAt > 60_000) {
+      lastSyncWarningAt = Date.now();
+      console.warn("[Gateway] Tunnel sync unavailable (gateway IPC offline or secret not shared)");
+    }
+  }
+}
+
+// Load persisted tunnels once into the in-memory routing state.
+async function loadTunnelsFromDb() {
+  if (tunnels.length > 0) return;
+  const dbTuns = await dbGetTunnels();
+  if (!dbTuns || dbTuns.length === 0) return;
+
+  dbTuns.forEach((t) => {
+    const subdomain = validateSubdomain(t.subdomain);
+    if (!subdomain) return;
+    if (tunnels.some((existing) => existing.subdomain === subdomain)) return;
+
+    tunnels.push({
+      id: t.id,
+      name: `Tunnel ${subdomain}`,
+      subdomain,
+      localPort: t.target_port || 3000,
+      protocol: t.protocol || "quic",
+      status: "offline",
+      tlsStatus: t.tls_status || "active",
+      authEnabled: Boolean(t.auth_enabled),
+      authUser: t.auth_user || undefined,
+      enabled: t.is_active !== false,
+      tokenHash: typeof t.token_hash === "string" ? t.token_hash : undefined,
+      tokenLast4: typeof t.token_last4 === "string" ? t.token_last4 : undefined,
+      maxRps: 150,
+      totalRequests: t.total_requests || 0,
+      bytesTransferred: t.bytes_transferred || 0,
+      avgLatency: t.avg_latency || 0,
+      publicUrl: `https://${subdomain}.edgeproxy.mesh`,
+      createdAt: t.created_at || new Date().toISOString(),
+    });
+  });
 }
 
 // Tunnels CRUD
 app.get("/api/tunnels", async (req, res) => {
-  if (tunnels.length === 0) {
-    const dbTuns = await dbGetTunnels();
-    if (dbTuns && dbTuns.length > 0) {
-      dbTuns.forEach((t) => {
-        if (!tunnels.some((existing) => existing.subdomain === t.subdomain)) {
-          tunnels.push({
-            id: t.id,
-            name: `Tunnel ${t.subdomain}`,
-            subdomain: t.subdomain,
-            localPort: t.target_port || 3000,
-            protocol: t.protocol || "quic",
-            status: t.is_active ? "online" : "offline",
-            tlsStatus: t.tls_status || "active",
-            authEnabled: Boolean(t.auth_enabled),
-            authUser: t.auth_user || undefined,
-            token: "edg_tok_" + crypto.createHash("md5").update(t.subdomain).digest("hex").slice(0, 16),
-            maxRps: 150,
-            totalRequests: t.total_requests || 0,
-            bytesTransferred: t.bytes_transferred || 0,
-            avgLatency: t.avg_latency || 0,
-            publicUrl: `https://${t.subdomain}.edgeproxy.mesh`,
-            createdAt: t.created_at || new Date().toISOString(),
-          });
-        }
-      });
-    }
-  }
+  await loadTunnelsFromDb();
 
   // Attempt to sync real telemetry from Go Gateway internal sessions
   try {
-    const sessRes = await fetch("http://127.0.0.1:80/internal/sessions", {
-      signal: AbortSignal.timeout(800),
-    });
+    const sessRes = await gatewayFetch("/internal/sessions", {}, 800);
     if (sessRes.ok) {
       const liveSessions = (await sessRes.json()) as Array<{
         subdomain: string;
@@ -306,50 +538,80 @@ app.get("/api/tunnels", async (req, res) => {
         };
       }>;
       if (Array.isArray(liveSessions)) {
+        const live = new Set(liveSessions.map((session) => session.subdomain));
+        for (const tun of tunnels) {
+          tun.status = live.has(tun.subdomain) ? "online" : "offline";
+        }
         for (const sess of liveSessions) {
           const tun = tunnels.find((t) => t.subdomain === sess.subdomain);
-          if (tun) {
-            tun.status = "online";
-            if (sess.telemetry) {
-              tun.totalRequests = sess.telemetry.totalRequests || tun.totalRequests;
-              tun.bytesTransferred = sess.telemetry.bytesSent + sess.telemetry.bytesReceived || tun.bytesTransferred;
-              tun.avgLatency = Math.round(sess.telemetry.avgLatencyMs * 10) / 10 || tun.avgLatency;
-            }
+          if (tun && sess.telemetry) {
+            tun.totalRequests = sess.telemetry.totalRequests || tun.totalRequests;
+            tun.bytesTransferred =
+              sess.telemetry.bytesSent + sess.telemetry.bytesReceived || tun.bytesTransferred;
+            tun.avgLatency = Math.round(sess.telemetry.avgLatencyMs * 10) / 10 || tun.avgLatency;
           }
         }
       }
     }
-  } catch (_) {}
+  } catch {
+    // Gateway IPC unavailable: keep the last known state.
+  }
 
-  res.json(tunnels);
+  res.json(tunnels.map(publicTunnel));
 });
 
 app.post("/api/tunnels", async (req, res) => {
   const { name, subdomain, localPort, protocol, authEnabled, authUser, maxRps } = req.body;
 
-  if (!subdomain || !localPort) {
-    return res.status(400).json({ error: "subdomain and localPort are required" });
+  const cleanSub = validateSubdomain(subdomain);
+  if (!cleanSub) {
+    return res.status(400).json({
+      error: "subdomain must be a single DNS label (a-z, 0-9, hyphen), max 63 chars",
+    });
   }
 
-  const cleanSub = String(subdomain).toLowerCase().trim().replace(/[^a-z0-9-]/g, "");
+  const port = Number(localPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return res.status(400).json({ error: "localPort must be an integer between 1 and 65535" });
+  }
+
+  const allowedProtocols = new Set(["quic", "http2", "websocket", "tcp"]);
+  if (protocol !== undefined && !allowedProtocols.has(String(protocol))) {
+    return res.status(400).json({ error: "Unsupported protocol" });
+  }
+
+  const rps = maxRps === undefined ? 100 : Number(maxRps);
+  if (!Number.isFinite(rps) || rps < 1 || rps > 100000) {
+    return res.status(400).json({ error: "maxRps must be between 1 and 100000" });
+  }
+
+  if (authUser !== undefined && (typeof authUser !== "string" || authUser.length > 128)) {
+    return res.status(400).json({ error: "authUser must be a string of at most 128 chars" });
+  }
+
   if (tunnels.some((t) => t.subdomain === cleanSub)) {
     return res.status(409).json({ error: `Subdomain '${cleanSub}' is already in use` });
   }
 
-  const token = "edg_tok_" + crypto.randomBytes(8).toString("hex");
+  // CSPRNG token; only the hash is persisted and only the hash reaches the gateway.
+  const agentToken = generateToken();
+  const tokenHash = hashToken(agentToken);
 
   const newTunnel: TunnelRecord = {
     id: `tun-${Date.now()}`,
-    name: name || `Tunnel ${cleanSub}`,
+    name: typeof name === "string" && name.trim() ? name.trim().slice(0, 128) : `Tunnel ${cleanSub}`,
     subdomain: cleanSub,
-    localPort: Number(localPort),
-    protocol: protocol || "quic",
-    status: "online",
+    localPort: port,
+    protocol: (protocol || "quic") as TunnelRecord["protocol"],
+    status: "offline",
     tlsStatus: certificates.some((c) => c.domain.includes(cleanSub) || c.wildcard) ? "active" : "failed",
     authEnabled: Boolean(authEnabled),
     authUser: authUser || undefined,
-    token,
-    maxRps: Number(maxRps) || 100,
+    enabled: true,
+    token: agentToken,
+    tokenHash,
+    tokenLast4: agentToken.slice(-4),
+    maxRps: rps,
     totalRequests: 0,
     bytesTransferred: 0,
     avgLatency: 0,
@@ -357,7 +619,7 @@ app.post("/api/tunnels", async (req, res) => {
     createdAt: new Date().toISOString(),
   };
 
-  // Persist to Database
+  // Persist to Database (hash only)
   await dbInsertTunnel({
     id: newTunnel.id,
     subdomain: newTunnel.subdomain,
@@ -367,12 +629,46 @@ app.post("/api/tunnels", async (req, res) => {
     auth_enabled: newTunnel.authEnabled,
     auth_user: newTunnel.authUser,
     is_active: true,
+    token_hash: tokenHash,
+    token_last4: newTunnel.tokenLast4,
+    created_at: newTunnel.createdAt,
   });
 
   tunnels.unshift(newTunnel);
-  syncGatewayTunnels();
-  broadcastWs("tunnel_created", newTunnel);
-  res.status(201).json(newTunnel);
+  void syncGatewayTunnels();
+  broadcastWs("tunnel_created", publicTunnel(newTunnel));
+  // The plaintext token is returned exactly once.
+  res.status(201).json({ ...publicTunnel(newTunnel), token: agentToken });
+});
+
+app.post("/api/tunnels/:id/rotate-token", async (req, res) => {
+  const tunnel = tunnels.find((t) => t.id === req.params.id);
+  if (!tunnel) {
+    return res.status(404).json({ error: "Tunnel not found" });
+  }
+
+  const agentToken = generateToken();
+  tunnel.token = agentToken;
+  tunnel.tokenHash = hashToken(agentToken);
+  tunnel.tokenLast4 = agentToken.slice(-4);
+
+  await dbInsertTunnel({
+    id: tunnel.id,
+    subdomain: tunnel.subdomain,
+    target_port: tunnel.localPort,
+    protocol: tunnel.protocol,
+    tls_status: tunnel.tlsStatus,
+    auth_enabled: tunnel.authEnabled,
+    auth_user: tunnel.authUser,
+    is_active: tunnel.enabled,
+    token_hash: tunnel.tokenHash,
+    token_last4: tunnel.tokenLast4,
+    created_at: tunnel.createdAt,
+  });
+
+  void syncGatewayTunnels();
+  broadcastWs("tunnel_updated", publicTunnel(tunnel));
+  res.json({ id: tunnel.id, token: agentToken, tokenLast4: tunnel.tokenLast4 });
 });
 
 app.delete("/api/tunnels/:id", async (req, res) => {
@@ -383,20 +679,39 @@ app.delete("/api/tunnels/:id", async (req, res) => {
   }
   const deleted = tunnels.splice(idx, 1)[0];
   await dbDeleteTunnel(deleted.id);
-  syncGatewayTunnels();
+  void syncGatewayTunnels();
   broadcastWs("tunnel_deleted", { id: deleted.id, subdomain: deleted.subdomain });
-  res.json({ message: "Tunnel deleted", tunnel: deleted });
+  res.json({ message: "Tunnel deleted", tunnel: publicTunnel(deleted) });
 });
 
-app.patch("/api/tunnels/:id/toggle", (req, res) => {
+app.patch("/api/tunnels/:id/toggle", async (req, res) => {
   const { id } = req.params;
   const tunnel = tunnels.find((t) => t.id === id);
   if (!tunnel) {
     return res.status(404).json({ error: "Tunnel not found" });
   }
-  tunnel.status = tunnel.status === "online" ? "offline" : "online";
-  broadcastWs("tunnel_updated", tunnel);
-  res.json(tunnel);
+  tunnel.enabled = !tunnel.enabled;
+  if (!tunnel.enabled) {
+    tunnel.status = "offline";
+  }
+
+  await dbInsertTunnel({
+    id: tunnel.id,
+    subdomain: tunnel.subdomain,
+    target_port: tunnel.localPort,
+    protocol: tunnel.protocol,
+    tls_status: tunnel.tlsStatus,
+    auth_enabled: tunnel.authEnabled,
+    auth_user: tunnel.authUser,
+    is_active: tunnel.enabled,
+    token_hash: tunnel.tokenHash,
+    token_last4: tunnel.tokenLast4,
+    created_at: tunnel.createdAt,
+  });
+
+  void syncGatewayTunnels();
+  broadcastWs("tunnel_updated", publicTunnel(tunnel));
+  res.json(publicTunnel(tunnel));
 });
 
 // Real local TCP port discovery
@@ -444,13 +759,14 @@ app.get("/api/discover", async (req, res) => {
   res.json(activeServices);
 });
 
-// Real TLS Certificates Management via Go Gateway ACME engine and Cryptographic ECDSA P-256
+// TLS certificate metadata. The gateway issues self-signed certificates for the
+// edge mesh; this is not a public ACME client yet.
 app.get("/api/certs", async (req, res) => {
+  let gatewayReachable = false;
   try {
-    const goRes = await fetch("http://127.0.0.1:80/internal/certs", {
-      signal: AbortSignal.timeout(800),
-    });
+    const goRes = await gatewayFetch("/internal/certs", {}, 800);
     if (goRes.ok) {
+      gatewayReachable = true;
       const goCerts = (await goRes.json()) as CertificateRecord[];
       if (Array.isArray(goCerts) && goCerts.length > 0) {
         for (const gc of goCerts) {
@@ -464,8 +780,11 @@ app.get("/api/certs", async (req, res) => {
         }
       }
     }
-  } catch (_) {
-    // If Go Gateway offline, load from Firestore DB
+  } catch {
+    // Gateway offline: fall through to persisted certificates.
+  }
+
+  if (!gatewayReachable) {
     const dbCerts = await dbGetCertificates();
     if (dbCerts && dbCerts.length > 0) {
       for (const dc of dbCerts) {
@@ -479,27 +798,40 @@ app.get("/api/certs", async (req, res) => {
 });
 
 app.post("/api/certs", async (req, res) => {
-  const { domain, wildcard = true, challengeType = "TLS-ALPN-01" } = req.body;
-  if (!domain) {
+  const { domain, wildcard = true } = req.body;
+
+  if (typeof domain !== "string") {
     return res.status(400).json({ error: "Domain is required" });
+  }
+  const cleanDomain = domain.trim().toLowerCase().replace(/^\*\./, "");
+  if (
+    cleanDomain.length > 253 ||
+    !/^(?!-)[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63})+$/.test(cleanDomain)
+  ) {
+    return res.status(400).json({ error: "Invalid domain name" });
   }
 
   let newCert: CertificateRecord | null = null;
 
-  // 1. Attempt to issue directly via Go Gateway ACME engine
+  // 1. Attempt to issue via the Go gateway certificate manager.
   try {
-    const goRes = await fetch("http://127.0.0.1:80/internal/certs/issue", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ domain, wildcard: Boolean(wildcard) }),
-      signal: AbortSignal.timeout(2000),
-    });
+    const goRes = await gatewayFetch(
+      "/internal/certs/issue",
+      {
+        method: "POST",
+        body: JSON.stringify({ domain: cleanDomain, wildcard: Boolean(wildcard) }),
+      },
+      2000,
+    );
     if (goRes.ok) {
       newCert = (await goRes.json()) as CertificateRecord;
     }
-  } catch (_) {}
+  } catch {
+    // Fall back to a local self-signed metadata record below.
+  }
 
-  // 2. Cryptographic generation using Node.js crypto (real ECDSA P-256 keypair + true SHA-256 fingerprint)
+  // 2. Local fallback. This only produces metadata and a fingerprint; it is not
+  //    a publicly trusted certificate, and it is labelled accordingly.
   if (!newCert) {
     const keyPair = crypto.generateKeyPairSync("ec", {
       namedCurve: "prime256v1",
@@ -513,18 +845,18 @@ app.post("/api/certs", async (req, res) => {
 
     newCert = {
       id: `cert-${Date.now()}`,
-      domain,
+      domain: cleanDomain,
       wildcard: Boolean(wildcard),
-      issuer: "Let's Encrypt / EdgeProxy ACME CA",
+      issuer: "EdgeProxy Self-Signed CA (not publicly trusted)",
       status: "valid",
       validFrom: now.toISOString().split("T")[0],
       validTo: validTo.toISOString().split("T")[0],
       daysRemaining: 90,
-      challengeType: challengeType === "HTTP-01" ? "HTTP-01" : "TLS-ALPN-01",
-      sanList: wildcard ? [`*.${domain}`, domain] : [domain],
-      ocspStapled: true,
+      challengeType: "SELF-SIGNED",
+      sanList: wildcard ? [`*.${cleanDomain}`, cleanDomain] : [cleanDomain],
+      ocspStapled: false,
       fingerprint: formattedFingerprint,
-      autoRenew: true,
+      autoRenew: false,
     };
   }
 
@@ -539,7 +871,7 @@ app.post("/api/certs", async (req, res) => {
 
   // Update existing tunnels matching this domain
   tunnels.forEach((t) => {
-    if (t.subdomain === domain || (wildcard && (domain.includes(t.subdomain) || t.subdomain.endsWith(domain.replace(/^\*\./, ""))))) {
+    if (t.subdomain === cleanDomain || (wildcard && cleanDomain.endsWith("." + t.subdomain))) {
       t.tlsStatus = "active";
     }
   });
@@ -555,17 +887,19 @@ app.post("/api/certs/:id/renew", async (req, res) => {
 
   // Renew via Go Gateway if available
   try {
-    const goRes = await fetch("http://127.0.0.1:80/internal/certs/issue", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ domain: cert.domain, wildcard: cert.wildcard }),
-      signal: AbortSignal.timeout(2000),
-    });
+    const goRes = await gatewayFetch(
+      "/internal/certs/issue",
+      {
+        method: "POST",
+        body: JSON.stringify({ domain: cert.domain, wildcard: cert.wildcard }),
+      },
+      2000,
+    );
     if (goRes.ok) {
       const renewed = (await goRes.json()) as CertificateRecord;
       Object.assign(cert, renewed);
     }
-  } catch (_) {
+  } catch {
     const now = new Date();
     const validTo = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
     cert.validFrom = now.toISOString().split("T")[0];
@@ -600,15 +934,36 @@ app.get("/api/ratelimit", (req, res) => {
 
 app.post("/api/ratelimit/config", (req, res) => {
   const { capacity, refillRate, whitelistIp } = req.body;
-  if (capacity) tokenCapacity = Number(capacity);
-  if (refillRate) refillRatePerSec = Number(refillRate);
-  if (whitelistIp) whitelistedIps.add(String(whitelistIp));
+
+  if (capacity !== undefined) {
+    const value = Number(capacity);
+    if (!Number.isFinite(value) || value < 1 || value > 1_000_000) {
+      return res.status(400).json({ error: "capacity must be between 1 and 1000000" });
+    }
+    tokenCapacity = value;
+  }
+
+  if (refillRate !== undefined) {
+    const value = Number(refillRate);
+    if (!Number.isFinite(value) || value < 0.1 || value > 1_000_000) {
+      return res.status(400).json({ error: "refillRate must be between 0.1 and 1000000" });
+    }
+    refillRatePerSec = value;
+  }
+
+  if (whitelistIp !== undefined) {
+    if (!isValidIp(whitelistIp)) {
+      return res.status(400).json({ error: "whitelistIp must be a valid IP address" });
+    }
+    whitelistedIps.add(whitelistIp);
+  }
+
   res.json({ success: true, capacity: tokenCapacity, refillRate: refillRatePerSec });
 });
 
 app.post("/api/ratelimit/unban", (req, res) => {
   const { ip } = req.body;
-  if (ip && bannedIps.has(ip)) {
+  if (isValidIp(ip) && bannedIps.has(ip)) {
     bannedIps.delete(ip);
     return res.json({ success: true, message: `IP ${ip} unbanned.` });
   }
@@ -630,6 +985,18 @@ app.delete("/api/traffic/logs", (req, res) => {
 app.post("/api/traffic/simulate", async (req, res) => {
   const { subdomain, method = "GET", path: reqPath = "/", clientIp = "127.0.0.1", isAttack = false } = req.body;
 
+  const allowedMethods = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]);
+  const normalizedMethod = String(method).toUpperCase();
+  if (!allowedMethods.has(normalizedMethod)) {
+    return res.status(400).json({ error: "Unsupported HTTP method" });
+  }
+  if (typeof reqPath !== "string" || !reqPath.startsWith("/") || reqPath.startsWith("//")) {
+    return res.status(400).json({ error: "path must be a relative URL starting with '/'" });
+  }
+  if (!isValidIp(clientIp)) {
+    return res.status(400).json({ error: "clientIp must be a valid IP address" });
+  }
+
   const targetTunnel = tunnels.find((t) => t.subdomain === subdomain) || tunnels[0];
   if (!targetTunnel) {
     return res.status(400).json({ error: "No tunnels registered. Create a tunnel first." });
@@ -642,7 +1009,7 @@ app.post("/api/traffic/simulate", async (req, res) => {
     const entry: LogEntry = {
       id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
       timestamp: new Date().toISOString(),
-      method: method.toUpperCase(),
+      method: normalizedMethod,
       path: reqPath,
       statusCode: 429,
       latencyMs: 1.2,
@@ -656,15 +1023,16 @@ app.post("/api/traffic/simulate", async (req, res) => {
     return res.status(429).json({ success: false, log: entry, reason: limitCheck.reason });
   }
 
-  // Ingress probe to Go Gateway data plane (Port 80/8080 with Subdomain Host header).
-  // Node.js is strictly the Control Plane and does NOT proxy directly to localPort.
-  const gatewayPort = 80;
-  const probeReq = http.request(
+  // Ingress probe to the Go data plane. Node.js is strictly the control plane
+  // and does not proxy customer traffic directly to localPort.
+  const gatewayTarget = new URL(GATEWAY_PUBLIC_URL);
+  const transport = gatewayTarget.protocol === "https:" ? https : http;
+  const probeReq = transport.request(
     {
-      hostname: "127.0.0.1",
-      port: gatewayPort,
+      hostname: gatewayTarget.hostname,
+      port: gatewayTarget.port || (gatewayTarget.protocol === "https:" ? 443 : 80),
       path: reqPath,
-      method: method.toUpperCase(),
+      method: normalizedMethod,
       headers: {
         Host: `${targetTunnel.subdomain}.edgeproxy.mesh`,
         "X-Forwarded-For": clientIp,
@@ -681,7 +1049,7 @@ app.post("/api/traffic/simulate", async (req, res) => {
         const entry: LogEntry = {
           id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
           timestamp: new Date().toISOString(),
-          method: method.toUpperCase(),
+          method: normalizedMethod,
           path: reqPath,
           statusCode: probeRes.statusCode || 200,
           latencyMs: latency,
@@ -692,7 +1060,7 @@ app.post("/api/traffic/simulate", async (req, res) => {
           blockedByShield: false,
         };
         recordRequest(entry);
-        res.json({ success: true, log: entry, routedVia: "Go Ingress Gateway (Port 80)" });
+        res.json({ success: true, log: entry, routedVia: "Go Ingress Gateway" });
       });
     }
   );
@@ -702,7 +1070,7 @@ app.post("/api/traffic/simulate", async (req, res) => {
     const entry: LogEntry = {
       id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
       timestamp: new Date().toISOString(),
-      method: method.toUpperCase(),
+      method: normalizedMethod,
       path: reqPath,
       statusCode: 502,
       latencyMs: latency,
@@ -713,17 +1081,22 @@ app.post("/api/traffic/simulate", async (req, res) => {
       blockedByShield: false,
     };
     recordRequest(entry);
-    res.json({ success: false, log: entry, error: "Go Ingress Gateway (port 80) / multiplexer wire unreachable", routedVia: "Go Ingress Gateway" });
+    res.json({
+      success: false,
+      log: entry,
+      error: "Go ingress gateway unreachable",
+      routedVia: "Go Ingress Gateway",
+    });
   });
 
   probeReq.end();
 });
 
-// Interactive SQL Query Runner against Real PostgreSQL Database
+// Read-only query console (allowlisted Firestore collections, SELECT only).
 app.post("/api/sql/query", async (req, res) => {
   const { query } = req.body;
-  if (!query || typeof query !== "string") {
-    return res.status(400).json({ error: "Query string is required" });
+  if (!query || typeof query !== "string" || query.length > 2000) {
+    return res.status(400).json({ error: "Query string is required (max 2000 chars)" });
   }
 
   try {
@@ -737,16 +1110,12 @@ app.post("/api/sql/query", async (req, res) => {
       source: result.source,
       status: "SUCCESS",
     });
-  } catch (err: any) {
-    res.status(400).json({
-      error: err.message,
-      query,
-      status: "ERROR",
-    });
+  } catch {
+    res.status(400).json({ error: "Query rejected", status: "ERROR" });
   }
 });
 
-// Database & Firebase Firestore Direct Management API
+// Database & Firestore management API (admin-only, secrets redacted).
 app.get("/api/database/status", (req, res) => {
   res.json(dbGetStatus());
 });
@@ -755,30 +1124,35 @@ app.get("/api/users", async (req, res) => {
   try {
     const userList = await dbGetUsers();
     res.json(userList);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch {
+    res.status(500).json({ error: "Failed to read users" });
   }
 });
 
 app.get("/api/database/collections/:name", async (req, res) => {
   try {
     const { name } = req.params;
-    const limit = Number(req.query.limit) || 50;
+    if (!isAllowedCollection(name)) {
+      return res.status(404).json({ error: "Unknown collection" });
+    }
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
     const docs = await dbGetCollectionDocs(name, limit);
     res.json({ collection: name, count: docs.length, docs });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch {
+    res.status(500).json({ error: "Failed to read collection" });
   }
 });
 
 app.post("/api/database/collections/:name", async (req, res) => {
+  const { name } = req.params;
+  if (!isAllowedCollection(name)) {
+    return res.status(404).json({ error: "Unknown collection" });
+  }
   try {
-    const { name } = req.params;
-    const docData = req.body;
-    const created = await dbInsertSampleDoc(name, docData);
+    const created = await dbInsertSampleDoc(name, req.body);
     res.json({ success: true, collection: name, doc: created });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch {
+    res.status(400).json({ error: "Document rejected" });
   }
 });
 
@@ -844,36 +1218,25 @@ Provide a concise technical diagnostic:
 
 // Explicit 404 Catch-All for unknown API endpoints
 app.all("/api/*", (req, res) => {
-  res.status(404).json({ error: `API route not found: ${req.method} ${req.path}` });
+  res.status(404).json({ error: "API route not found" });
+});
+
+// Central error handler. Never leak stack traces, SQL or file paths.
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) return next(err);
+  if (err?.type === "entity.parse.failed" || err?.type === "entity.too.large") {
+    return res.status(400).json({ error: "Invalid request body" });
+  }
+  console.error("[Server] Unhandled request error:", err?.message || err);
+  res.status(500).json({ error: "Internal server error" });
 });
 
 // Vite Middleware & SPA Static Fallback
 async function start() {
-  // Initialize Database connection (PostgreSQL / Relational Engine)
   await initDb();
-  const dbTunnels = await dbGetTunnels();
-  if (dbTunnels && dbTunnels.length > 0) {
-    dbTunnels.forEach((t) => {
-      if (!tunnels.some((existing) => existing.subdomain === t.subdomain)) {
-        tunnels.push({
-          id: t.id,
-          name: `Tunnel ${t.subdomain}`,
-          subdomain: t.subdomain,
-          localPort: t.target_port || 3000,
-          protocol: t.protocol || "quic",
-          status: t.is_active ? "online" : "offline",
-          tlsStatus: t.tls_status || "active",
-          authEnabled: Boolean(t.auth_enabled),
-          authUser: t.auth_user || undefined,
-          totalRequests: 0,
-          bytesTransferred: 0,
-          avgLatency: 0,
-          publicUrl: `https://${t.subdomain}.edgeproxy.mesh`,
-          createdAt: t.created_at || new Date().toISOString(),
-        });
-      }
-    });
-  }
+  await loadTunnelsFromDb();
+  // Push the persisted allowlist to the gateway as soon as the control plane is up.
+  void syncGatewayTunnels();
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -883,14 +1246,20 @@ async function start() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, { index: false, maxAge: "1h" }));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`[EdgeProxy Server] Listening on http://0.0.0.0:${PORT} (Full-Stack Mode)`);
+  server.listen(PORT, HOST, () => {
+    console.log(`[EdgeProxy Server] Listening on http://${HOST}:${PORT} (control plane)`);
+    if (!API_KEY) {
+      console.log("[Auth] EDGEPROXY_API_KEY not set: loopback-only mode with CSRF header required.");
+    }
+    if (!GATEWAY_INTERNAL_SECRET) {
+      console.log("[Gateway] EDGEPROXY_INTERNAL_SECRET not set: tunnel/cert IPC sync disabled.");
+    }
   });
 }
 

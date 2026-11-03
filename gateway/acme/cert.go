@@ -8,12 +8,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"log"
 	"math/big"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,19 +21,19 @@ import (
 
 // CertificateMeta holds metadata for the dashboard and ACME status reports
 type CertificateMeta struct {
-	ID            string    `json:"id"`
-	Domain        string    `json:"domain"`
-	Wildcard      bool      `json:"wildcard"`
-	Issuer        string    `json:"issuer"`
-	Status        string    `json:"status"` // "valid", "renewing", "pending_challenge", "revoked"
-	ValidFrom     string    `json:"validFrom"`
-	ValidTo       string    `json:"validTo"`
-	DaysRemaining int       `json:"daysRemaining"`
-	ChallengeType string    `json:"challengeType"` // "DNS-01", "HTTP-01", "TLS-ALPN-01"
-	SANList       []string  `json:"sanList"`
-	OCSPStapled   bool      `json:"ocspStapled"`
-	Fingerprint   string    `json:"fingerprint"`
-	AutoRenew     bool      `json:"autoRenew"`
+	ID            string   `json:"id"`
+	Domain        string   `json:"domain"`
+	Wildcard      bool     `json:"wildcard"`
+	Issuer        string   `json:"issuer"`
+	Status        string   `json:"status"` // "valid", "renewing", "pending_challenge", "revoked"
+	ValidFrom     string   `json:"validFrom"`
+	ValidTo       string   `json:"validTo"`
+	DaysRemaining int      `json:"daysRemaining"`
+	ChallengeType string   `json:"challengeType"` // "SELF-SIGNED" (no public ACME client yet)
+	SANList       []string `json:"sanList"`
+	OCSPStapled   bool     `json:"ocspStapled"`
+	Fingerprint   string   `json:"fingerprint"`
+	AutoRenew     bool     `json:"autoRenew"`
 }
 
 // CertManager handles automated TLS termination, ACME issuance, and certificate hot-reloading
@@ -52,7 +50,7 @@ func NewCertManager(baseDomain string, certDir string) *CertManager {
 	if certDir == "" {
 		certDir = "./certs"
 	}
-	_ = os.MkdirAll(certDir, 0755)
+	_ = os.MkdirAll(certDir, 0750)
 
 	cm := &CertManager{
 		certificates: make(map[string]*tls.Certificate),
@@ -116,7 +114,7 @@ func (m *CertManager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certifica
 
 	// On-demand issuance for recognized subdomains
 	if strings.HasSuffix(serverName, "."+m.baseDomain) || serverName == m.baseDomain {
-		log.Printf("[ACME] On-demand TLS certificate generation for SNI: %s", serverName)
+		log.Printf("[TLS] On-demand TLS certificate generation for SNI: %s", serverName)
 		meta, err := m.IssueOrRenew(serverName, false)
 		if err == nil && meta != nil {
 			m.mu.RLock()
@@ -131,8 +129,17 @@ func (m *CertManager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certifica
 	return nil, fmt.Errorf("no certificate found matching SNI: %s", serverName)
 }
 
-// IssueOrRenew creates or renews a real X.509 ECDSA certificate
+// IssueOrRenew creates or renews a self-signed X.509 ECDSA certificate for the
+// edge mesh. It is intentionally labelled as self-signed: there is no public
+// ACME client inside the gateway yet.
 func (m *CertManager) IssueOrRenew(domain string, wildcard bool) (*CertificateMeta, error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	wildcard = wildcard || strings.HasPrefix(domain, "*.")
+	domain = strings.TrimPrefix(domain, "*.")
+	if !validDomain(domain) {
+		return nil, fmt.Errorf("invalid domain name: %q", domain)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -160,7 +167,7 @@ func (m *CertManager) IssueOrRenew(domain string, wildcard bool) (*CertificateMe
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   domain,
-			Organization: []string{"EdgeProxy Automated ACME CA"},
+			Organization: []string{"EdgeProxy Self-Signed CA"},
 		},
 		NotBefore:             now.Add(-1 * time.Hour),
 		NotAfter:              validTo,
@@ -212,20 +219,20 @@ func (m *CertManager) IssueOrRenew(domain string, wildcard bool) (*CertificateMe
 		ID:            fmt.Sprintf("cert-%d", now.UnixNano()),
 		Domain:        domain,
 		Wildcard:      wildcard,
-		Issuer:        "Let's Encrypt / EdgeProxy ACME CA",
+		Issuer:        "EdgeProxy Self-Signed CA (not publicly trusted)",
 		Status:        "valid",
 		ValidFrom:     now.Format("2006-01-02"),
 		ValidTo:       validTo.Format("2006-01-02"),
 		DaysRemaining: 90,
-		ChallengeType: "TLS-ALPN-01",
+		ChallengeType: "SELF-SIGNED",
 		SANList:       sanList,
-		OCSPStapled:   true,
+		OCSPStapled:   false,
 		Fingerprint:   fingerprint,
 		AutoRenew:     true,
 	}
 
 	m.metadata[certKey] = meta
-	log.Printf("[ACME] Successfully issued certificate for %s (Fingerprint: %s)", certKey, fingerprint)
+	log.Printf("[TLS] Successfully issued certificate for %s (Fingerprint: %s)", certKey, fingerprint)
 	return meta, nil
 }
 
@@ -246,27 +253,66 @@ func (m *CertManager) bootstrapWildcardCert() error {
 	return err
 }
 
-// AutoRenewLoop checks for certificates expiring within 30 days
+// validDomain accepts a lowercase DNS name made of at least two labels.
+func validDomain(domain string) bool {
+	if len(domain) == 0 || len(domain) > 253 {
+		return false
+	}
+	labels := strings.Split(domain, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// AutoRenewLoop renews certificates that expire within 30 days.
 func (m *CertManager) AutoRenewLoop() {
 	ticker := time.NewTicker(12 * time.Hour)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		log.Printf("[ACME] Running scheduled automated renewal check...")
+		log.Printf("[TLS] Running scheduled certificate expiry check...")
+
 		m.mu.RLock()
-		toRenew := make([]string, 0)
-		for domain, meta := range m.metadata {
-			if meta.AutoRenew {
-				toRenew = append(toRenew, domain)
-			}
+		snapshot := make(map[string]*CertificateMeta, len(m.metadata))
+		for key, meta := range m.metadata {
+			snapshot[key] = meta
 		}
 		m.mu.RUnlock()
 
-		for _, domain := range toRenew {
-			cleanDomain := strings.TrimPrefix(domain, "*.")
-			isWildcard := strings.HasPrefix(domain, "*.")
+		for key, meta := range snapshot {
+			if !meta.AutoRenew {
+				continue
+			}
+			// A wildcard entry also updates its bare-domain alias; renew once.
+			if !strings.HasPrefix(key, "*.") {
+				if _, hasWildcard := snapshot["*."+key]; hasWildcard {
+					continue
+				}
+			}
+
+			validTo, err := time.Parse("2006-01-02", meta.ValidTo)
+			if err == nil && time.Until(validTo) > 30*24*time.Hour {
+				continue
+			}
+
+			cleanDomain := strings.TrimPrefix(key, "*.")
+			isWildcard := strings.HasPrefix(key, "*.")
 			if _, err := m.IssueOrRenew(cleanDomain, isWildcard); err != nil {
-				log.Printf("[ACME] Automated renewal failed for %s: %v", domain, err)
+				log.Printf("[TLS] Automated renewal failed for %s: %v", key, err)
 			}
 		}
 	}

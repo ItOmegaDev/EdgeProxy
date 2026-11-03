@@ -10,19 +10,19 @@ import (
 
 // TelemetryReport represents the telemetry payload sent from Local Agent to Edge Gateway
 type TelemetryReport struct {
-	AgentID          string    `json:"agentId"`
-	Subdomain        string    `json:"subdomain"`
-	Timestamp        time.Time `json:"timestamp"`
-	TotalRequests    uint64    `json:"totalRequests"`
-	ActiveStreams    int32     `json:"activeStreams"`
-	BytesSent        uint64    `json:"bytesSent"`
-	BytesReceived    uint64    `json:"bytesReceived"`
-	AvgLatencyMs     float64   `json:"avgLatencyMs"`
-	P50LatencyMs     float64   `json:"p50LatencyMs"`
-	P95LatencyMs     float64   `json:"p95LatencyMs"`
-	P99LatencyMs     float64   `json:"p99LatencyMs"`
-	ErrorCount       uint64    `json:"errorCount"`
-	LocalServiceRTT  float64   `json:"localServiceRttMs"`
+	AgentID         string    `json:"agentId"`
+	Subdomain       string    `json:"subdomain"`
+	Timestamp       time.Time `json:"timestamp"`
+	TotalRequests   uint64    `json:"totalRequests"`
+	ActiveStreams   int32     `json:"activeStreams"`
+	BytesSent       uint64    `json:"bytesSent"`
+	BytesReceived   uint64    `json:"bytesReceived"`
+	AvgLatencyMs    float64   `json:"avgLatencyMs"`
+	P50LatencyMs    float64   `json:"p50LatencyMs"`
+	P95LatencyMs    float64   `json:"p95LatencyMs"`
+	P99LatencyMs    float64   `json:"p99LatencyMs"`
+	ErrorCount      uint64    `json:"errorCount"`
+	LocalServiceRTT float64   `json:"localServiceRttMs"`
 }
 
 // LocalMetricsCollector aggregates stream-level telemetry inside the Local Agent

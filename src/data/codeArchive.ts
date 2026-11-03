@@ -35,8 +35,10 @@ func main() {
 	baseDomain := flag.String("domain", "edgeproxy.mesh", "Base wildcard domain for tunnels")
 	rateLimitRps := flag.Float64("rps", 100.0, "Per-IP allowed RPS before burst shield")
 	burstCapacity := flag.Float64("burst", 150.0, "Maximum burst capacity for token bucket")
-	controlPlaneURL := flag.String("control-plane", "http://127.0.0.1:3000", "Node.js Control Plane API URL")
-	certDir := flag.String("cert-dir", "./certs", "Directory for ACME and TLS certificates")
+	controlPlaneURL := flag.String("control-plane", "http://127.0.0.1:3000", "Deprecated: control plane pushes tunnel state via IPC")
+	internalAddr := flag.String("internal-addr", "127.0.0.1:8081", "Private control-plane IPC address")
+	internalSecret := flag.String("internal-secret", os.Getenv("EDGEPROXY_INTERNAL_SECRET"), "Shared secret for private IPC")
+	certDir := flag.String("cert-dir", "./certs", "Directory for TLS certificates")
 	flag.Parse()
 
 	log.Printf("==========================================================")
@@ -44,8 +46,8 @@ func main() {
 	log.Printf("  Base Domain: *.%s", *baseDomain)
 	log.Printf("  Ingress Ports: HTTP :%d | HTTPS :%d | Tunnel :%d", *httpPort, *tlsPort, *tunnelPort)
 	log.Printf("  Shield: TokenBucket %.0f RPS / %.0f Burst with Auto-Jail", *rateLimitRps, *burstCapacity)
-	log.Printf("  TLS Termination: Real ECDSA P-256 + ACME SNI on :%d", *tlsPort)
-	log.Printf("  Control Plane Sync: %s", *controlPlaneURL)
+	log.Printf("  TLS: Self-signed ECDSA P-256 with SNI on :%d (not publicly trusted)", *tlsPort)
+	log.Printf("  Internal IPC: %s (secret configured: %t)", *internalAddr, *internalSecret != "")
 	log.Printf("==========================================================")
 
 	router := proxy.NewRouter(*baseDomain, *rateLimitRps, *burstCapacity)
@@ -307,19 +309,27 @@ func (r *Router) SyncAllowedTunnels(configs []AllowedTunnelConfig) {
 	defer r.mu.Unlock()
 	newMap := make(map[string]AllowedTunnelConfig)
 	for _, cfg := range configs {
+		if !ValidSubdomain(cfg.Subdomain) || !validTokenHash(cfg.AuthTokenHash) {
+			continue
+		}
 		newMap[cfg.Subdomain] = cfg
 	}
 	r.allowedTunnels = newMap
 }
 
 func (r *Router) VerifyAuthorization(subdomain, token string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if len(r.allowedTunnels) == 0 {
-		return token != ""
+	if !ValidSubdomain(subdomain) || token == "" || len(token) > 512 {
+		return false
 	}
+	r.mu.RLock()
 	cfg, exists := r.allowedTunnels[subdomain]
-	return exists && cfg.IsActive && (cfg.AuthToken == "" || cfg.AuthToken == token)
+	r.mu.RUnlock()
+	if !exists || !cfg.IsActive || !validTokenHash(cfg.AuthTokenHash) {
+		return false
+	}
+	sum := sha256.Sum256([]byte(token))
+	presented := hex.EncodeToString(sum[:])
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(strings.ToLower(cfg.AuthTokenHash))) == 1
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -552,14 +562,14 @@ func (m *CertManager) IssueOrRenew(domain string, wildcard bool) (*CertificateMe
 		ID:            fmt.Sprintf("cert-%d", now.UnixNano()),
 		Domain:        domain,
 		Wildcard:      wildcard,
-		Issuer:        "Let's Encrypt / EdgeProxy ACME CA",
+		Issuer:        "EdgeProxy Self-Signed CA (not publicly trusted)",
 		Status:        "valid",
 		ValidFrom:     now.Format("2006-01-02"),
 		ValidTo:       validTo.Format("2006-01-02"),
 		DaysRemaining: 90,
-		ChallengeType: "TLS-ALPN-01",
+		ChallengeType: "SELF-SIGNED",
 		SANList:       sanList,
-		OCSPStapled:   true,
+		OCSPStapled:   false,
 		Fingerprint:   "SHA256: " + strings.Join(hexParts, ":"),
 		AutoRenew:     true,
 	}
@@ -1205,13 +1215,14 @@ CREATE TABLE traffic_logs (
   'db/02_indexes.sql': `-- Indexes for sub-millisecond route matching and time-series telemetry
 CREATE INDEX idx_tunnels_subdomain_active ON tunnels (subdomain) WHERE status = 'online';
 CREATE INDEX idx_tunnels_user_id ON tunnels (user_id);
-CREATE INDEX idx_users_api_key ON users (api_key);
+CREATE INDEX idx_users_api_key_hash ON users (api_key_hash);
 CREATE INDEX idx_traffic_subdomain_time ON traffic_logs (subdomain, recorded_at DESC);
 CREATE INDEX idx_traffic_blocked_ip ON traffic_logs (client_ip, recorded_at DESC) WHERE blocked_by_shield = TRUE;`,
 
   'db/03_seed.sql': `-- Bootstrap Seed Migration
-INSERT INTO users (id, email, api_key, plan_tier, max_tunnels, max_rps)
-VALUES ('00000000-0000-0000-0000-000000000001', 'admin@edgeproxy.mesh', 'edg_sec_09a47f12e8b6c43d91', 'enterprise', 50, 1000)
+-- Store only a SHA-256 hash; never commit a real API key.
+INSERT INTO users (id, email, api_key_hash, plan_tier, max_tunnels, max_rps)
+VALUES ('00000000-0000-0000-0000-000000000001', 'admin@edgeproxy.mesh', 'REPLACE_WITH_SHA256_HEX_OF_API_KEY', 'enterprise', 50, 1000)
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO tunnels (id, user_id, subdomain, target_port, protocol, status)

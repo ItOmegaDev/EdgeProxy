@@ -15,6 +15,40 @@ export interface BackendTunnel {
   avgLatency: number;
   publicUrl: string;
   createdAt: string;
+  tokenLast4?: string;
+  /** Returned only by create/rotate responses. */
+  token?: string;
+}
+
+const API_KEY_STORAGE = 'edgeproxy_api_key';
+
+export function getStoredApiKey(): string | null {
+  try {
+    return localStorage.getItem(API_KEY_STORAGE);
+  } catch {
+    return null;
+  }
+}
+
+export function setStoredApiKey(key: string): void {
+  try {
+    if (key.trim()) localStorage.setItem(API_KEY_STORAGE, key.trim());
+    else localStorage.removeItem(API_KEY_STORAGE);
+  } catch {
+    // Storage can be unavailable in private mode; requests then run unauthenticated.
+  }
+}
+
+/**
+ * All control-plane calls are same-origin JSON. The CSRF header is required in
+ * loopback mode, and the Bearer key is used when the server has auth enabled.
+ */
+function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set('X-EdgeProxy-CSRF', '1');
+  const key = getStoredApiKey();
+  if (key) headers.set('Authorization', `Bearer ${key}`);
+  return fetch(input, { ...init, headers });
 }
 
 export interface BackendLog {
@@ -49,13 +83,13 @@ export interface AiDiagnosticResult {
 
 export const api = {
   async getStatus() {
-    const res = await fetch('/api/status');
+    const res = await apiFetch('/api/status');
     if (!res.ok) throw new Error('Failed to fetch gateway status');
     return res.json();
   },
 
   async getTunnels(): Promise<BackendTunnel[]> {
-    const res = await fetch('/api/tunnels');
+    const res = await apiFetch('/api/tunnels');
     if (!res.ok) throw new Error('Failed to fetch tunnels');
     return res.json();
   },
@@ -68,7 +102,7 @@ export const api = {
     authEnabled?: boolean;
     authUser?: string;
   }): Promise<BackendTunnel> {
-    const res = await fetch('/api/tunnels', {
+    const res = await apiFetch('/api/tunnels', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -81,35 +115,41 @@ export const api = {
   },
 
   async deleteTunnel(id: string): Promise<void> {
-    const res = await fetch(`/api/tunnels/${id}`, { method: 'DELETE' });
+    const res = await apiFetch(`/api/tunnels/${id}`, { method: 'DELETE' });
     if (!res.ok) throw new Error('Failed to delete tunnel');
   },
 
   async toggleTunnel(id: string): Promise<BackendTunnel> {
-    const res = await fetch(`/api/tunnels/${id}/toggle`, { method: 'PATCH' });
+    const res = await apiFetch(`/api/tunnels/${id}/toggle`, { method: 'PATCH' });
     if (!res.ok) throw new Error('Failed to toggle tunnel state');
     return res.json();
   },
 
+  async rotateTunnelToken(id: string): Promise<{ id: string; token: string; tokenLast4: string }> {
+    const res = await apiFetch(`/api/tunnels/${id}/rotate-token`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to rotate tunnel token');
+    return res.json();
+  },
+
   async getLogs(): Promise<BackendLog[]> {
-    const res = await fetch('/api/traffic/logs');
+    const res = await apiFetch('/api/traffic/logs');
     if (!res.ok) throw new Error('Failed to fetch traffic logs');
     return res.json();
   },
 
   async clearLogs(): Promise<void> {
-    const res = await fetch('/api/traffic/logs', { method: 'DELETE' });
+    const res = await apiFetch('/api/traffic/logs', { method: 'DELETE' });
     if (!res.ok) throw new Error('Failed to clear traffic logs');
   },
 
   async getCerts(): Promise<any[]> {
-    const res = await fetch('/api/certs');
+    const res = await apiFetch('/api/certs');
     if (!res.ok) throw new Error('Failed to fetch certificates');
     return res.json();
   },
 
   async issueCert(payload: { domain: string; wildcard?: boolean; challengeType?: string }): Promise<any> {
-    const res = await fetch('/api/certs', {
+    const res = await apiFetch('/api/certs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -122,25 +162,25 @@ export const api = {
   },
 
   async renewCert(id: string): Promise<any> {
-    const res = await fetch(`/api/certs/${id}/renew`, { method: 'POST' });
+    const res = await apiFetch(`/api/certs/${id}/renew`, { method: 'POST' });
     if (!res.ok) throw new Error('Failed to renew certificate');
     return res.json();
   },
 
   async discoverPorts(): Promise<any[]> {
-    const res = await fetch('/api/discover');
+    const res = await apiFetch('/api/discover');
     if (!res.ok) throw new Error('Failed to scan local ports');
     return res.json();
   },
 
   async getRateLimiter(): Promise<any> {
-    const res = await fetch('/api/ratelimit');
+    const res = await apiFetch('/api/ratelimit');
     if (!res.ok) throw new Error('Failed to fetch rate limiter config');
     return res.json();
   },
 
   async updateRateLimiter(payload: any): Promise<any> {
-    const res = await fetch('/api/ratelimit/config', {
+    const res = await apiFetch('/api/ratelimit/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -150,7 +190,7 @@ export const api = {
   },
 
   async unbanIp(ip: string): Promise<void> {
-    const res = await fetch('/api/ratelimit/unban', {
+    const res = await apiFetch('/api/ratelimit/unban', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ip }),
@@ -165,7 +205,7 @@ export const api = {
     clientIp?: string;
     isAttack?: boolean;
   }): Promise<{ success: boolean; log: BackendLog }> {
-    const res = await fetch('/api/traffic/simulate', {
+    const res = await apiFetch('/api/traffic/simulate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
@@ -175,7 +215,7 @@ export const api = {
   },
 
   async executeSql(query: string): Promise<SqlResult> {
-    const res = await fetch('/api/sql/query', {
+    const res = await apiFetch('/api/sql/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query }),
@@ -188,25 +228,25 @@ export const api = {
   },
 
   async getDatabaseStatus(): Promise<any> {
-    const res = await fetch('/api/database/status');
+    const res = await apiFetch('/api/database/status');
     if (!res.ok) throw new Error('Failed to fetch database status');
     return res.json();
   },
 
   async getUsers(): Promise<any[]> {
-    const res = await fetch('/api/users');
+    const res = await apiFetch('/api/users');
     if (!res.ok) throw new Error('Failed to fetch users');
     return res.json();
   },
 
   async getFirestoreCollection(name: string, limit: number = 50): Promise<{ collection: string; count: number; docs: any[] }> {
-    const res = await fetch(`/api/database/collections/${name}?limit=${limit}`);
+    const res = await apiFetch(`/api/database/collections/${name}?limit=${limit}`);
     if (!res.ok) throw new Error(`Failed to fetch collection ${name}`);
     return res.json();
   },
 
   async insertFirestoreDoc(name: string, data: any): Promise<any> {
-    const res = await fetch(`/api/database/collections/${name}`, {
+    const res = await apiFetch(`/api/database/collections/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
@@ -216,7 +256,7 @@ export const api = {
   },
 
   async diagnoseWithAi(topic: string = 'traffic_anomalies', contextData?: any): Promise<AiDiagnosticResult> {
-    const res = await fetch('/api/ai/diagnose', {
+    const res = await apiFetch('/api/ai/diagnose', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ topic, contextData }),
@@ -242,7 +282,8 @@ export const api = {
       const wsUrl = `${protocol}//${window.location.host}/ws`;
 
       try {
-        ws = new WebSocket(wsUrl);
+        const apiKey = getStoredApiKey();
+        ws = apiKey ? new WebSocket(wsUrl, ['edgeproxy', apiKey]) : new WebSocket(wsUrl);
 
         ws.onopen = () => {
           if (onStatusChange) onStatusChange(true);

@@ -517,7 +517,7 @@ export default function App() {
             <span className="text-zinc-400">{isWsConnected ? 'WS Live' : 'Connecting WS...'}</span>
           </div>
           <div>
-            <span>Multiplexed Encrypted QUIC • Token Bucket • Let's Encrypt ACME v2</span>
+            <span>Multiplexed TCP • Token Bucket • Self-signed TLS</span>
           </div>
         </div>
       </footer>

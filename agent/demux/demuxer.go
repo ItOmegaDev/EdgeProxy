@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -24,6 +23,11 @@ func NewStreamDemuxer(targetAddr string) *StreamDemuxer {
 		targetAddr: targetAddr,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
+			// Never follow redirects: a local service must not be able to
+			// redirect the agent into an arbitrary destination.
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
